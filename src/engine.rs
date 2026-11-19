@@ -12,7 +12,9 @@ use time::OffsetDateTime;
 use crate::mining::{self, Attempt, Hash256, Job, Work};
 use crate::storage::{Best, Storage};
 use crate::stratum::Stratum;
-use crate::workers::{CpuWorkers, NONCE_SPACE};
+use crate::workers::{Batch, CpuWorkers};
+
+type PendingShares = HashMap<u64, (bool, String)>;
 
 pub fn max_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
@@ -161,7 +163,6 @@ pub fn start(config: Config, storage: Storage, best: Option<Best>) -> Connection
             storage,
             best_dirty: false,
             automatic: false,
-            next_nonce: 0,
             submitted: HashSet::new(),
         };
         engine.run();
@@ -181,7 +182,6 @@ struct Engine {
     storage: Storage,
     best_dirty: bool,
     automatic: bool,
-    next_nonce: u64,
     submitted: HashSet<(Vec<u8>, u32)>,
 }
 
@@ -258,8 +258,15 @@ impl Engine {
 
     fn session(&mut self) -> Result<()> {
         let mut socket = Stratum::connect(&self.config.endpoint)?;
-        let subscribe = socket.call("mining.subscribe", json!(["bitcoin-detailed/0.1"]))?;
         let mut workers = CpuWorkers::new(self.config.threads)?;
+        let result = self.run_session(&mut socket, &mut workers);
+        // Preserve work already computed if the connection failed during a range.
+        self.pause_workers(&workers, None)?;
+        result
+    }
+
+    fn run_session(&mut self, socket: &mut Stratum, workers: &mut CpuWorkers) -> Result<()> {
+        let subscribe = socket.call("mining.subscribe", json!(["bitcoin-detailed/0.1"]))?;
         let mut authorize = None;
         let mut authorized = false;
         let mut extranonce1 = Vec::new();
@@ -277,12 +284,8 @@ impl Engine {
         self.publish();
 
         loop {
-            // Wait only while idle. During mining, check the reader's queue between batches.
-            let wait = if self.snapshot.running {
-                Duration::ZERO
-            } else {
-                Duration::from_millis(10)
-            };
+            // Workers keep hashing while this thread waits for pool messages.
+            let wait = Duration::from_millis(if self.snapshot.running { 2 } else { 10 });
             let messages = socket.read(wait);
             if !messages.is_empty() {
                 last_read = Instant::now();
@@ -309,21 +312,38 @@ impl Engine {
                     Some("mining.notify") => {
                         let job = Job::parse(params, difficulty.as_ref())?;
                         if latest_job.as_ref() != Some(&job) {
+                            self.pause_workers(
+                                workers,
+                                (!job.clean).then_some((&mut *socket, &mut shares)),
+                            )?;
                             latest_job = Some(job.clone());
                             tx_request = None;
                             self.invalidate_work();
                             if authorized {
-                                self.install_job(job, &extranonce1, extranonce2_size, &payout)?;
+                                self.install_job(
+                                    workers,
+                                    job,
+                                    &extranonce1,
+                                    extranonce2_size,
+                                    &payout,
+                                )?;
                             }
                         }
                     }
                     Some("mining.set_extranonce") => {
                         (extranonce1, extranonce2_size) =
                             parse_extranonces(&params[0], &params[1])?;
+                        self.pause_workers(workers, None)?;
                         tx_request = None;
                         self.invalidate_work();
                         if authorized && let Some(job) = latest_job.clone() {
-                            self.install_job(job, &extranonce1, extranonce2_size, &payout)?;
+                            self.install_job(
+                                workers,
+                                job,
+                                &extranonce1,
+                                extranonce2_size,
+                                &payout,
+                            )?;
                         }
                     }
                     Some("client.show_message") => {
@@ -358,7 +378,13 @@ impl Engine {
                         authorized = true;
                         self.snapshot.status = "Authorized · waiting for a job".into();
                         if let Some(job) = latest_job.clone() {
-                            self.install_job(job, &extranonce1, extranonce2_size, &payout)?;
+                            self.install_job(
+                                workers,
+                                job,
+                                &extranonce1,
+                                extranonce2_size,
+                                &payout,
+                            )?;
                         }
                     }
                     None if tx_request
@@ -417,7 +443,10 @@ impl Engine {
 
             loop {
                 match self.commands.try_recv() {
-                    Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pause_workers(workers, Some((socket, &mut shares)))?;
+                        return Ok(());
+                    }
                     Ok(Command::Toggle) => {
                         self.automatic = !self.automatic;
                         self.snapshot.message = if self.automatic {
@@ -426,9 +455,10 @@ impl Engine {
                             "Mining paused.".into()
                         };
                     }
-                    Ok(Command::SetThreads(count)) => self.set_threads(count, Some(&mut workers)),
+                    Ok(Command::SetThreads(count)) => self.set_threads(count, Some(workers)),
                     Ok(Command::Manual(shown, nonce)) => {
                         self.automatic = false;
+                        self.pause_workers(workers, Some((socket, &mut shares)))?;
                         self.snapshot.message = "Manual attempt · mining paused.".into();
                         if self
                             .snapshot
@@ -441,7 +471,7 @@ impl Engine {
                             self.snapshot.total += 1;
                             self.record_best(&shown, attempt, None);
                             if attempt.hash <= shown.job.submission_target() {
-                                self.submit(&shown, nonce, attempt.hash, &mut socket, &mut shares)?;
+                                self.submit(&shown, nonce, attempt.hash, socket, &mut shares)?;
                             }
                         } else {
                             self.snapshot.message =
@@ -466,41 +496,34 @@ impl Engine {
                 }
             }
 
-            self.snapshot.running = self.automatic
-                && self
-                    .snapshot
-                    .work
-                    .as_ref()
-                    .is_some_and(|work| work.paid_sats > 0);
-            if self.snapshot.running
-                && let Some(mut work) = self.snapshot.work.clone()
+            if self.automatic
+                && let Some(work) = self.snapshot.work.clone().filter(|work| work.paid_sats > 0)
             {
-                if self.next_nonce == NONCE_SPACE {
+                let (batch, exhausted) = workers.drain();
+                if let Some(batch) = batch {
+                    self.apply_batch(&work, batch, Some((socket, &mut shares)))?;
+                }
+                if exhausted {
+                    self.snapshot.running = false;
                     let mut nonce2 = work.extranonce2.clone();
                     if mining::increment(&mut nonce2) {
-                        work =
+                        let next =
                             Arc::new(Work::new(work.job.clone(), &extranonce1, nonce2, &payout)?);
-                        self.snapshot.work = Some(work.clone());
-                        self.next_nonce = 0;
+                        workers.install(next.clone(), self.best_limit());
+                        self.snapshot.work = Some(next);
+                        self.snapshot.last = None;
                     } else {
                         self.automatic = false;
-                        self.snapshot.running = false;
                         self.snapshot.message =
                             "Nonce space exhausted. Waiting for a new job.".into();
                     }
                 }
-                if self.snapshot.running {
-                    let best_limit = self.snapshot.best.as_ref().map(|best| best.hash);
-                    let batch = workers.scan(&work, &mut self.next_nonce, best_limit)?;
-                    self.snapshot.last = Some(batch.last);
-                    self.snapshot.total += batch.count;
-                    if let Some((attempt, timestamp)) = batch.best {
-                        self.record_best(&work, attempt, Some(timestamp));
-                    }
-                    for (nonce, hash) in batch.solutions {
-                        self.submit(&work, nonce, hash, &mut socket, &mut shares)?;
-                    }
+                if self.automatic && !self.snapshot.running {
+                    workers.resume(self.best_limit());
+                    self.snapshot.running = true;
                 }
+            } else if self.snapshot.running {
+                self.pause_workers(workers, Some((socket, &mut shares)))?;
             }
 
             let elapsed = updated.elapsed();
@@ -524,23 +547,61 @@ impl Engine {
         self.snapshot.txids = None;
         self.snapshot.tx_status = "Press T to request the TXIDs for this job.".into();
         self.submitted.clear();
-        self.next_nonce = 0;
     }
 
     fn install_job(
         &mut self,
+        workers: &CpuWorkers,
         job: Job,
         extranonce1: &[u8],
         len: usize,
         payout: &bitcoin::Script,
     ) -> Result<()> {
-        let work = Work::new(job, extranonce1, vec![0; len], payout)?;
+        let work = Arc::new(Work::new(job, extranonce1, vec![0; len], payout)?);
         self.snapshot.status = if work.paid_sats == 0 {
             "Job received · no payout output for your address".into()
         } else {
             "Mainnet job received · payout found in the coinbase".into()
         };
-        self.snapshot.work = Some(Arc::new(work));
+        workers.install(work.clone(), self.best_limit());
+        self.snapshot.work = Some(work);
+        Ok(())
+    }
+
+    fn best_limit(&self) -> Option<Hash256> {
+        self.snapshot.best.as_ref().map(|best| best.hash)
+    }
+
+    fn pause_workers(
+        &mut self,
+        workers: &CpuWorkers,
+        submission: Option<(&mut Stratum, &mut PendingShares)>,
+    ) -> Result<()> {
+        self.snapshot.running = false;
+        if let Some(batch) = workers.pause()
+            && let Some(work) = self.snapshot.work.clone()
+        {
+            self.apply_batch(&work, batch, submission)?;
+        }
+        Ok(())
+    }
+
+    fn apply_batch(
+        &mut self,
+        work: &Work,
+        batch: Batch,
+        submission: Option<(&mut Stratum, &mut PendingShares)>,
+    ) -> Result<()> {
+        self.snapshot.last = Some(batch.last);
+        self.snapshot.total += batch.count;
+        if let Some((attempt, timestamp)) = batch.best {
+            self.record_best(work, attempt, Some(timestamp));
+        }
+        if let Some((socket, shares)) = submission {
+            for (nonce, hash) in batch.solutions {
+                self.submit(work, nonce, hash, socket, shares)?;
+            }
+        }
         Ok(())
     }
 
@@ -568,7 +629,7 @@ impl Engine {
         nonce: u32,
         hash: Hash256,
         socket: &mut Stratum,
-        shares: &mut HashMap<u64, (bool, String)>,
+        shares: &mut PendingShares,
     ) -> Result<()> {
         let is_block = hash <= work.job.network_target;
         if work.paid_sats > 0 && self.submitted.insert((work.extranonce2.clone(), nonce)) {

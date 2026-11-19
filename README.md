@@ -46,7 +46,7 @@ coinb1 || extranonce1 || extranonce2 || coinb2
   → is the hash, read as a 256-bit integer, at or below the target?
 ```
 
-The **Header** tab shows each field's bytes and purpose, both SHA-256 digests, and the byte order used to display and compare the hash. The miner caches the SHA-256 state after the first 64 bytes of the header and gives each thread its own range of nonces. The **Merkle** tab shows the intermediate hashes. When the 32-bit nonce runs out, the miner increments extranonce2 in the coinbase, calculates a new Merkle root, and rebuilds the cached state.
+The **Header** tab shows each field's bytes and purpose, both SHA-256 digests, and the byte order used to display and compare the hash. The miner caches the SHA-256 state after the first 64 bytes of the header and lets each thread take its next range of nonces independently. The **Merkle** tab shows the intermediate hashes. When the 32-bit nonce runs out, the miner increments extranonce2 in the coinbase, calculates a new Merkle root, and rebuilds the cached state.
 
 ## What the pool provides
 

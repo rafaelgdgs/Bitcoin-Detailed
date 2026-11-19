@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -10,109 +10,163 @@ use crate::mining::{Attempt, Hash256, Work};
 
 pub const NONCE_SPACE: u64 = u32::MAX as u64 + 1;
 const BATCH_SIZE: u64 = 16_384;
+const MAX_PENDING_SOLUTIONS: usize = 4_096;
 
-struct Task {
-    work: Arc<Work>,
-    range: Range<u64>,
+#[derive(Default)]
+struct Scheduler {
+    work: Option<Arc<Work>>,
+    next_nonce: u64,
     best_limit: Option<Hash256>,
+    pending: Option<Batch>,
+    in_flight: usize,
+    thread_count: usize,
+    running: bool,
+    stopping: bool,
 }
 
-struct Worker {
-    tasks: mpsc::Sender<Task>,
-    results: mpsc::Receiver<Batch>,
+impl Scheduler {
+    fn exhausted(&self) -> bool {
+        self.next_nonce == NONCE_SPACE && self.in_flight == 0
+    }
+
+    fn backpressured(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|batch| batch.solutions.len() >= MAX_PENDING_SOLUTIONS)
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    scheduler: Mutex<Scheduler>,
+    changed: Condvar,
 }
 
 pub struct CpuWorkers {
-    workers: Vec<Worker>,
+    shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl CpuWorkers {
     pub fn new(count: usize) -> Result<Self> {
-        Self::spawn(1..count)
-    }
-
-    pub fn resize(&mut self, count: usize) -> Result<()> {
-        let current = self.workers.len() + 1;
-        if count > current {
-            // Keep the existing pool intact if any of the new threads fail to start.
-            let mut added = Self::spawn(current..count)?;
-            self.workers.append(&mut added.workers);
-            self.threads.append(&mut added.threads);
-        } else if count < current {
-            self.workers.truncate(count - 1);
-            for thread in self.threads.drain(count - 1..) {
-                let _ = thread.join();
-            }
-        }
-        Ok(())
-    }
-
-    fn spawn(numbers: Range<usize>) -> Result<Self> {
         let mut pool = Self {
-            workers: Vec::new(),
+            shared: Arc::new(Shared::default()),
             threads: Vec::new(),
         };
-        // The coordinator hashes one range itself, so one configured thread stays inline.
-        for number in numbers {
-            let (tasks, pending) = mpsc::channel::<Task>();
-            let (finished, results) = mpsc::channel();
-            let thread = thread::Builder::new()
-                .name(format!("mining-worker-{number}"))
-                .spawn(move || {
-                    while let Ok(task) = pending.recv() {
-                        if finished
-                            .send(scan(&task.work, task.range, task.best_limit))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                })
-                .with_context(|| format!("Could not start mining worker {number}"))?;
-            pool.workers.push(Worker { tasks, results });
-            pool.threads.push(thread);
-        }
+        pool.resize(count)?;
         Ok(pool)
     }
 
-    pub fn scan(
-        &self,
-        work: &Arc<Work>,
-        next_nonce: &mut u64,
-        best_limit: Option<Hash256>,
-    ) -> Result<Batch> {
-        let own_range = take_range(next_nonce);
-        let mut dispatched = 0;
-        for worker in &self.workers {
-            let range = take_range(next_nonce);
-            if range.is_empty() {
-                break;
-            }
-            worker
-                .tasks
-                .send(Task {
-                    work: work.clone(),
-                    range,
-                    best_limit,
-                })
-                .context("Mining worker stopped")?;
-            dispatched += 1;
+    pub fn resize(&mut self, count: usize) -> Result<()> {
+        for index in self.threads.len()..count {
+            let shared = self.shared.clone();
+            let worker = thread::Builder::new()
+                .name(format!("mining-worker-{}", index + 1))
+                .spawn(move || run_worker(shared, index))
+                .with_context(|| format!("Could not start mining worker {}", index + 1))?;
+            self.threads.push(worker);
         }
+        // Workers above the limit finish their current range, then sleep.
+        self.shared.scheduler.lock().unwrap().thread_count = count;
+        self.shared.changed.notify_all();
+        Ok(())
+    }
 
-        let mut batch = scan(work, own_range, best_limit);
-        for worker in &self.workers[..dispatched] {
-            batch.merge(worker.results.recv().context("Mining worker stopped")?);
+    pub fn install(&self, work: Arc<Work>, best_limit: Option<Hash256>) {
+        let mut state = self.shared.scheduler.lock().unwrap();
+        debug_assert!(state.in_flight == 0 && state.pending.is_none());
+        state.running = false;
+        state.work = Some(work);
+        state.next_nonce = 0;
+        state.best_limit = best_limit;
+    }
+
+    pub fn resume(&self, best_limit: Option<Hash256>) {
+        let mut state = self.shared.scheduler.lock().unwrap();
+        if let Some(limit) = best_limit {
+            state.best_limit = Some(state.best_limit.map_or(limit, |current| current.min(limit)));
         }
-        Ok(batch)
+        state.running = true;
+        self.shared.changed.notify_all();
+    }
+
+    pub fn pause(&self) -> Option<Batch> {
+        let mut state = self.shared.scheduler.lock().unwrap();
+        state.running = false;
+        let mut state = self
+            .shared
+            .changed
+            .wait_while(state, |state| state.in_flight > 0)
+            .unwrap();
+        state.pending.take()
+    }
+
+    pub fn drain(&self) -> (Option<Batch>, bool) {
+        let mut state = self.shared.scheduler.lock().unwrap();
+        let was_full = state.backpressured();
+        let report = state.pending.take();
+        if was_full {
+            self.shared.changed.notify_all();
+        }
+        (report, state.exhausted())
     }
 }
 
 impl Drop for CpuWorkers {
     fn drop(&mut self) {
-        self.workers.clear();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+        self.shared.scheduler.lock().unwrap().stopping = true;
+        self.shared.changed.notify_all();
+        for worker in self.threads.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_worker(shared: Arc<Shared>, index: usize) {
+    let mut state = shared.scheduler.lock().unwrap();
+    loop {
+        if state.stopping {
+            break;
+        }
+        if !state.running
+            || index >= state.thread_count
+            || state.next_nonce == NONCE_SPACE
+            || state.backpressured()
+        {
+            state = shared.changed.wait(state).unwrap();
+            continue;
+        }
+
+        let work = state
+            .work
+            .as_ref()
+            .expect("Running workers have a job")
+            .clone();
+        let best_limit = state.best_limit;
+        let start = state.next_nonce;
+        let end = (start + BATCH_SIZE).min(NONCE_SPACE);
+        state.next_nonce = end;
+        state.in_flight += 1;
+        drop(state);
+
+        let batch = scan(&work, start..end, best_limit);
+        state = shared.scheduler.lock().unwrap();
+        if let Some((best, _)) = &batch.best
+            && state
+                .best_limit
+                .as_ref()
+                .is_none_or(|limit| best.hash < *limit)
+        {
+            state.best_limit = Some(best.hash);
+        }
+        if let Some(pending) = &mut state.pending {
+            pending.merge(batch);
+        } else {
+            state.pending = Some(batch);
+        }
+        state.in_flight -= 1;
+        if state.in_flight == 0 && (!state.running || state.exhausted()) {
+            shared.changed.notify_all();
         }
     }
 }
@@ -142,12 +196,6 @@ impl Batch {
         }
         self.solutions.append(&mut other.solutions);
     }
-}
-
-fn take_range(next_nonce: &mut u64) -> Range<u64> {
-    let start = *next_nonce;
-    *next_nonce = (start + BATCH_SIZE).min(NONCE_SPACE);
-    start..*next_nonce
 }
 
 fn scan(work: &Work, range: Range<u64>, mut best_limit: Option<Hash256>) -> Batch {
@@ -193,7 +241,7 @@ mod tests {
     use crate::mining::Job;
 
     #[test]
-    fn resizing_workers_preserves_the_nonce_cursor_through_the_last_nonce() -> Result<()> {
+    fn independent_workers_preserve_nonce_coverage_across_pause_and_resize() -> Result<()> {
         let block = genesis_block(Network::Bitcoin);
         let coinbase = &block.txdata[0];
         let share = ("test".into(), [255; 32]);
@@ -218,32 +266,83 @@ mod tests {
             &coinbase.output[0].script_pubkey,
         )?);
         let mut workers = CpuWorkers::new(1)?;
-        let mut next_nonce = NONCE_SPACE - 4 * BATCH_SIZE - 3;
-        for (threads, expected_count) in [(1, BATCH_SIZE), (3, 3 * BATCH_SIZE), (1, 3)] {
-            workers.resize(threads)?;
-            let start = next_nonce;
-            let batch = workers.scan(&work, &mut next_nonce, None)?;
-            assert_eq!(batch.count, expected_count);
-            assert_eq!(next_nonce, start + expected_count);
-            assert!(
-                batch
-                    .solutions
-                    .iter()
-                    .map(|(nonce, _)| u64::from(*nonce))
-                    .eq(start..next_nonce)
-            );
-            assert_eq!(
-                batch.best.unwrap().0.hash,
-                batch.solutions.iter().map(|(_, hash)| *hash).min().unwrap()
-            );
-            if next_nonce == NONCE_SPACE {
-                assert_eq!(
-                    batch.solutions.last().unwrap().1,
-                    work.try_nonce(u32::MAX).hash
-                );
-            }
+        let start = NONCE_SPACE - 6 * BATCH_SIZE - 3;
+        workers.install(work.clone(), None);
+        workers.shared.scheduler.lock().unwrap().next_nonce = start;
+        workers.resume(None);
+
+        let (mut combined, _) = wait_for_report(&workers)?;
+        if let Some(batch) = workers.pause() {
+            combined.merge(batch);
         }
-        assert_eq!(next_nonce, NONCE_SPACE);
+        let paused_at = workers.shared.scheduler.lock().unwrap().next_nonce;
+        assert!(paused_at > start && paused_at < NONCE_SPACE);
+
+        workers.resize(3)?;
+        assert!(workers.drain().0.is_none());
+        assert_eq!(
+            workers.shared.scheduler.lock().unwrap().next_nonce,
+            paused_at
+        );
+        workers.resume(None);
+        let (batch, mut exhausted) = wait_for_report(&workers)?;
+        combined.merge(batch);
+        workers.resize(1)?;
+        while !exhausted {
+            let (batch, done) = wait_for_report(&workers)?;
+            combined.merge(batch);
+            exhausted = done;
+        }
+
+        assert_eq!(combined.count, NONCE_SPACE - start);
+        combined.solutions.sort_unstable_by_key(|(nonce, _)| *nonce);
+        assert!(
+            combined
+                .solutions
+                .iter()
+                .map(|(nonce, _)| u64::from(*nonce))
+                .eq(start..NONCE_SPACE)
+        );
+        assert_eq!(
+            combined.solutions.last().unwrap().1,
+            work.try_nonce(u32::MAX).hash
+        );
+        assert_eq!(
+            combined.best.unwrap().0.hash,
+            combined
+                .solutions
+                .iter()
+                .map(|(_, hash)| *hash)
+                .min()
+                .unwrap()
+        );
+
+        assert!(workers.pause().is_none());
+        let mut new_job = work.job.clone();
+        new_job.time += 1;
+        let new_work = Arc::new(Work::new(
+            new_job,
+            &[],
+            vec![],
+            &coinbase.output[0].script_pubkey,
+        )?);
+        workers.install(new_work.clone(), None);
+        assert_eq!(workers.shared.scheduler.lock().unwrap().next_nonce, 0);
+        workers.resume(None);
+        let (fresh, _) = wait_for_report(&workers)?;
+        assert_eq!(fresh.last.header[..76], new_work.header()[..76]);
         Ok(())
+    }
+
+    fn wait_for_report(workers: &CpuWorkers) -> Result<(Batch, bool)> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let (batch, exhausted) = workers.drain();
+            if let Some(batch) = batch {
+                return Ok((batch, exhausted));
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        anyhow::bail!("Timed out waiting for mining workers")
     }
 }
