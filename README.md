@@ -23,6 +23,7 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 | Key | Action |
 | --- | --- |
 | Space | Start or pause automatic mining using the configured CPU threads |
+| C | Change the CPU thread count without pausing or reconnecting. Press Enter to apply and save it |
 | N | Test a nonce on the displayed job. Enter decimal or hexadecimal, such as `0x1234`. The attempt pauses automatic mining |
 | 1–6, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, and Best |
 | B | Toggle hexadecimal and binary. In binary, 32-byte hashes and targets use four rows of eight bytes when the terminal is wide enough |

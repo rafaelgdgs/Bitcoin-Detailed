@@ -29,12 +29,32 @@ pub struct CpuWorkers {
 
 impl CpuWorkers {
     pub fn new(count: usize) -> Result<Self> {
+        Self::spawn(1..count)
+    }
+
+    pub fn resize(&mut self, count: usize) -> Result<()> {
+        let current = self.workers.len() + 1;
+        if count > current {
+            // Keep the existing pool intact if any of the new threads fail to start.
+            let mut added = Self::spawn(current..count)?;
+            self.workers.append(&mut added.workers);
+            self.threads.append(&mut added.threads);
+        } else if count < current {
+            self.workers.truncate(count - 1);
+            for thread in self.threads.drain(count - 1..) {
+                let _ = thread.join();
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn(numbers: Range<usize>) -> Result<Self> {
         let mut pool = Self {
             workers: Vec::new(),
             threads: Vec::new(),
         };
         // The coordinator hashes one range itself, so one configured thread stays inline.
-        for number in 1..count {
+        for number in numbers {
             let (tasks, pending) = mpsc::channel::<Task>();
             let (finished, results) = mpsc::channel();
             let thread = thread::Builder::new()
@@ -173,7 +193,7 @@ mod tests {
     use crate::mining::Job;
 
     #[test]
-    fn workers_cover_disjoint_ranges_without_wrapping_at_the_last_nonce() -> Result<()> {
+    fn resizing_workers_preserves_the_nonce_cursor_through_the_last_nonce() -> Result<()> {
         let block = genesis_block(Network::Bitcoin);
         let coinbase = &block.txdata[0];
         let share = ("test".into(), [255; 32]);
@@ -197,27 +217,33 @@ mod tests {
             vec![],
             &coinbase.output[0].script_pubkey,
         )?);
-        let workers = CpuWorkers::new(3)?;
-        let start = NONCE_SPACE - 2 * BATCH_SIZE - 3;
-        let mut next_nonce = start;
-        let batch = workers.scan(&work, &mut next_nonce, None)?;
+        let mut workers = CpuWorkers::new(1)?;
+        let mut next_nonce = NONCE_SPACE - 4 * BATCH_SIZE - 3;
+        for (threads, expected_count) in [(1, BATCH_SIZE), (3, 3 * BATCH_SIZE), (1, 3)] {
+            workers.resize(threads)?;
+            let start = next_nonce;
+            let batch = workers.scan(&work, &mut next_nonce, None)?;
+            assert_eq!(batch.count, expected_count);
+            assert_eq!(next_nonce, start + expected_count);
+            assert!(
+                batch
+                    .solutions
+                    .iter()
+                    .map(|(nonce, _)| u64::from(*nonce))
+                    .eq(start..next_nonce)
+            );
+            assert_eq!(
+                batch.best.unwrap().0.hash,
+                batch.solutions.iter().map(|(_, hash)| *hash).min().unwrap()
+            );
+            if next_nonce == NONCE_SPACE {
+                assert_eq!(
+                    batch.solutions.last().unwrap().1,
+                    work.try_nonce(u32::MAX).hash
+                );
+            }
+        }
         assert_eq!(next_nonce, NONCE_SPACE);
-        assert_eq!(batch.count, NONCE_SPACE - start);
-        assert!(
-            batch
-                .solutions
-                .iter()
-                .map(|(nonce, _)| u64::from(*nonce))
-                .eq(start..NONCE_SPACE)
-        );
-        assert_eq!(
-            batch.solutions.last().unwrap().1,
-            work.try_nonce(u32::MAX).hash
-        );
-        assert_eq!(
-            batch.best.unwrap().0.hash,
-            batch.solutions.iter().map(|(_, hash)| *hash).min().unwrap()
-        );
         Ok(())
     }
 }

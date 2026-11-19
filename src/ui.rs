@@ -52,6 +52,19 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+enum Prompt {
+    Nonce(Arc<Work>, String),
+    Threads(String),
+}
+
+impl Prompt {
+    fn input_mut(&mut self) -> &mut String {
+        match self {
+            Self::Nonce(_, input) | Self::Threads(input) => input,
+        }
+    }
+}
+
 struct App {
     form: SetupForm,
     storage: Storage,
@@ -61,7 +74,7 @@ struct App {
     tab: usize,
     scroll: u16,
     binary: bool,
-    manual: Option<(Arc<Work>, String)>,
+    prompt: Option<Prompt>,
     notice: String,
     tx_index: usize,
     selected_job: Option<String>,
@@ -88,7 +101,7 @@ impl App {
             tab: 0,
             scroll: 0,
             binary: false,
-            manual: None,
+            prompt: None,
             notice,
             tx_index: 0,
             selected_job: None,
@@ -120,8 +133,8 @@ impl App {
                     }
                 }
                 Event::Paste(text) => {
-                    if let Some((_, input)) = &mut self.manual {
-                        append_input(input, &text, 32);
+                    if let Some(prompt) = &mut self.prompt {
+                        append_input(prompt.input_mut(), &text, 32);
                     } else if self.connection.is_none() {
                         append_input(&mut self.form[self.field], &text, 256);
                     }
@@ -181,32 +194,40 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent, snapshot: Option<&Snapshot>) -> bool {
-        if let Some((work, input)) = &mut self.manual {
+        if let Some(prompt) = &mut self.prompt {
             match key.code {
                 KeyCode::Esc => {
-                    self.manual = None;
+                    self.prompt = None;
                     self.notice.clear();
                 }
-                KeyCode::Enter => match mining::parse_nonce(input) {
-                    Ok(nonce) => {
-                        let command = Command::Manual(work.clone(), nonce);
-                        self.manual = None;
-                        self.notice.clear();
-                        self.send(command);
+                KeyCode::Enter => {
+                    let command = match prompt {
+                        Prompt::Nonce(work, input) => mining::parse_nonce(input)
+                            .map(|nonce| Command::Manual(work.clone(), nonce))
+                            .context("Enter an integer from 0 to 4294967295 or 0x00000000 to 0xffffffff."),
+                        Prompt::Threads(input) => engine::parse_thread_count(input).map(Command::SetThreads),
+                    };
+                    match command {
+                        Ok(command) => {
+                            self.prompt = None;
+                            self.notice.clear();
+                            self.send(command);
+                        }
+                        Err(error) => self.notice = error.to_string(),
                     }
-                    Err(_) => {
-                        self.notice =
-                            "Enter an integer from 0 to 4294967295 or 0x00000000 to 0xffffffff."
-                                .into()
-                    }
-                },
-                KeyCode::Backspace => {
-                    input.pop();
                 }
-                KeyCode::Char(c)
-                    if input.len() < 32 && (c.is_ascii_hexdigit() || matches!(c, 'x' | 'X')) =>
-                {
-                    input.push(c);
+                KeyCode::Backspace => {
+                    prompt.input_mut().pop();
+                }
+                KeyCode::Char(c) => {
+                    let allowed = match prompt {
+                        Prompt::Nonce(..) => c.is_ascii_hexdigit() || matches!(c, 'x' | 'X'),
+                        Prompt::Threads(_) => c.is_ascii_digit(),
+                    };
+                    let input = prompt.input_mut();
+                    if allowed && input.len() < 32 {
+                        input.push(c);
+                    }
                 }
                 _ => {}
             }
@@ -268,8 +289,12 @@ impl App {
             KeyCode::Char('n') => {
                 if let Some(work) = &snapshot.work {
                     self.select_tab(0);
-                    self.manual = Some((work.clone(), String::new()));
+                    self.prompt = Some(Prompt::Nonce(work.clone(), String::new()));
                 }
+            }
+            KeyCode::Char('c' | 'C') => {
+                self.notice.clear();
+                self.prompt = Some(Prompt::Threads(String::new()));
             }
             KeyCode::Char('t') => {
                 if let Some(work) = &snapshot.work {
@@ -403,12 +428,17 @@ impl App {
             .saturating_sub(inner.height as usize);
         self.scroll = self.scroll.min(bottom.min(u16::MAX as usize) as u16);
         frame.render_widget(paragraph.scroll((self.scroll, 0)), inner);
-        let prompt = match &self.manual {
-            Some((_, input)) => {
+        let prompt = match &self.prompt {
+            Some(Prompt::Nonce(_, input)) => {
                 format!(" Nonce in decimal or 0x…  › {input}▌  [Enter test · Esc cancel]")
             }
+            Some(Prompt::Threads(input)) => format!(
+                " CPU threads (1–{}, current {})  › {input}▌  [Enter apply · Esc cancel]",
+                engine::max_threads(),
+                snapshot.threads
+            ),
             None => {
-                " 1–6/Tab tabs · Space mine/pause · N nonce · B hex/bin · T TXIDs · Q quit".into()
+                " 1–6/Tab tabs · Space mine/pause · C threads · N nonce · B hex/bin · T TXIDs · Q quit".into()
             }
         };
         let message = if self.notice.is_empty() {

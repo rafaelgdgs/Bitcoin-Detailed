@@ -147,6 +147,11 @@ impl Storage {
         self.update(|state| state.form.clone_from(form))
     }
 
+    pub fn save_threads(&self, count: usize) -> Result<()> {
+        self.update(|state| state.form[4] = count.to_string())?;
+        Ok(())
+    }
+
     pub fn save_best(&self, best: &Best) -> Result<SavedState> {
         self.update(|state| {
             if state
@@ -306,6 +311,8 @@ mod tests {
                 Ok(())
             })?;
             storage.save_best(&older)?;
+            storage.save_threads(3)?;
+            form[4] = "3".into();
             let saved = storage.load()?;
             Ok((form, saved, better))
         })();

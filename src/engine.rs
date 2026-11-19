@@ -18,6 +18,16 @@ pub fn max_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
 }
 
+pub fn parse_thread_count(input: &str) -> Result<usize> {
+    let max = max_threads();
+    input
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|count| (1..=max).contains(count))
+        .with_context(|| format!("Enter a CPU thread count from 1 to {max}"))
+}
+
 pub struct Config {
     pub endpoint: String,
     pub address: Address,
@@ -64,13 +74,7 @@ impl Config {
         } else {
             format!("{address}.{worker}")
         };
-        let max = max_threads();
-        let threads = threads
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|count| (1..=max).contains(count))
-            .with_context(|| format!("Enter a CPU thread count from 1 to {max}"))?;
+        let threads = parse_thread_count(threads)?;
         Ok(Self {
             endpoint: endpoint.to_owned(),
             address,
@@ -83,6 +87,7 @@ impl Config {
 
 pub enum Command {
     Toggle,
+    SetThreads(usize),
     Manual(Arc<Work>, u32),
     Txids(Arc<Work>),
     Stop,
@@ -201,6 +206,25 @@ impl Engine {
         }
     }
 
+    fn set_threads(&mut self, count: usize, workers: Option<&mut CpuWorkers>) {
+        if let Some(workers) = workers
+            && let Err(error) = workers.resize(count)
+        {
+            self.snapshot.message = format!("Could not change CPU threads: {error:#}");
+            self.publish();
+            return;
+        }
+        self.config.threads = count;
+        self.snapshot.threads = count;
+        self.snapshot.message = match self.storage.save_threads(count) {
+            Ok(()) => format!("CPU threads set to {count}."),
+            Err(error) => {
+                format!("CPU threads set to {count}. Could not save the setting: {error:#}")
+            }
+        };
+        self.publish();
+    }
+
     fn run(&mut self) {
         loop {
             if let Err(error) = self.session() {
@@ -224,6 +248,7 @@ impl Engine {
                 {
                     Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Ok(Command::Toggle) => self.automatic = !self.automatic,
+                    Ok(Command::SetThreads(count)) => self.set_threads(count, None),
                     Ok(_) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                 }
@@ -234,7 +259,7 @@ impl Engine {
     fn session(&mut self) -> Result<()> {
         let mut socket = Stratum::connect(&self.config.endpoint)?;
         let subscribe = socket.call("mining.subscribe", json!(["bitcoin-detailed/0.1"]))?;
-        let workers = CpuWorkers::new(self.config.threads)?;
+        let mut workers = CpuWorkers::new(self.config.threads)?;
         let mut authorize = None;
         let mut authorized = false;
         let mut extranonce1 = Vec::new();
@@ -401,6 +426,7 @@ impl Engine {
                             "Mining paused.".into()
                         };
                     }
+                    Ok(Command::SetThreads(count)) => self.set_threads(count, Some(&mut workers)),
                     Ok(Command::Manual(shown, nonce)) => {
                         self.automatic = false;
                         self.snapshot.message = "Manual attempt · mining paused.".into();
