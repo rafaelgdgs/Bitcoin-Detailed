@@ -229,7 +229,13 @@ impl Engine {
         self.publish();
 
         loop {
-            let messages = socket.read()?;
+            // Wait only while idle. During mining, check the reader's queue between batches.
+            let wait = if self.snapshot.running {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(10)
+            };
+            let messages = socket.read(wait);
             if !messages.is_empty() {
                 last_read = Instant::now();
             }
@@ -243,6 +249,7 @@ impl Engine {
                 "Timed out waiting for Stratum messages"
             );
             for message in messages {
+                let message = message?;
                 let id = message["id"].as_u64();
                 let params = &message["params"];
                 let result = &message["result"];
