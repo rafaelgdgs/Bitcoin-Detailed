@@ -12,7 +12,9 @@ cargo run --release
 
 The default endpoint is `stratum.ckpool.org:3333` ([Solo CKPool](https://solo.ckpool.org/)). Paste your **public Bitcoin mainnet address** for payouts and press **Enter**. The worker name is optional. CKPool accepts `x` as the password. To use a different pool, enter a Stratum V1 TCP endpoint that supports solo mining with direct coinbase payouts.
 
-Pressing **Enter** saves the pool endpoint, public address, worker, and pool password in `bitcoin-detailed.json` next to the executable. The same file holds the best hash, its discovery time in UTC, and the header that produced it. The next launch starts with the form filled in, regardless of the working directory. The file stores the pool password as plain text and is created with owner-only permissions on Unix.
+Use **Tab** or **↓** to reach **CPU threads** on the connection screen. The default is one thread. You can enter any count up to the limit shown in the form.
+
+Pressing **Enter** saves the pool endpoint, public address, worker, pool password, and thread count in `bitcoin-detailed.json` next to the executable. The same file holds the best hash, its discovery time in UTC, and the header that produced it. The next launch starts with the form filled in, regardless of the working directory. The file stores the pool password as plain text and is created with owner-only permissions on Unix.
 
 When upgrading, launch once from the directory where you previously ran the miner to import its old best-hash file. The app also looks for that file next to the executable and imports settings from the previous user config location. If you run through Cargo, the executable and the JSON are in `target/debug` or `target/release`; keep a copy of the JSON before running `cargo clean`.
 
@@ -20,7 +22,7 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 
 | Key | Action |
 | --- | --- |
-| Space | Start or pause automatic mining on one CPU thread |
+| Space | Start or pause automatic mining using the configured CPU threads |
 | N | Test a nonce on the displayed job. Enter decimal or hexadecimal, such as `0x1234`. The attempt pauses automatic mining |
 | 1–6, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, and Best |
 | B | Toggle hexadecimal and binary. In binary, 32-byte hashes and targets use four rows of eight bytes when the terminal is wide enough |
@@ -43,7 +45,7 @@ coinb1 || extranonce1 || extranonce2 || coinb2
   → is the hash, read as a 256-bit integer, at or below the target?
 ```
 
-The **Header** tab shows each field's bytes and purpose, both SHA-256 digests, and the byte order used to display and compare the hash. The **Merkle** tab shows the intermediate hashes. When the 32-bit nonce runs out, the miner increments extranonce2 in the coinbase and calculates a new Merkle root.
+The **Header** tab shows each field's bytes and purpose, both SHA-256 digests, and the byte order used to display and compare the hash. The miner caches the SHA-256 state after the first 64 bytes of the header and gives each thread its own range of nonces. The **Merkle** tab shows the intermediate hashes. When the 32-bit nonce runs out, the miner increments extranonce2 in the coinbase, calculates a new Merkle root, and rebuilds the cached state.
 
 ## What the pool provides
 

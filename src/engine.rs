@@ -9,19 +9,31 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
-use crate::mining::{self, Attempt, Job, Work};
+use crate::mining::{self, Attempt, Hash256, Job, Work};
 use crate::storage::{Best, Storage};
 use crate::stratum::Stratum;
+use crate::workers::{CpuWorkers, NONCE_SPACE};
+
+pub fn max_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
 
 pub struct Config {
     pub endpoint: String,
     pub address: Address,
     pub user: String,
     pub password: String,
+    pub threads: usize,
 }
 
 impl Config {
-    pub fn new(endpoint: &str, address: &str, worker: &str, password: &str) -> Result<Self> {
+    pub fn new(
+        endpoint: &str,
+        address: &str,
+        worker: &str,
+        password: &str,
+        threads: &str,
+    ) -> Result<Self> {
         let address = Address::<NetworkUnchecked>::from_str(address.trim())
             .context("Invalid Bitcoin address")?
             .require_network(Network::Bitcoin)
@@ -52,11 +64,19 @@ impl Config {
         } else {
             format!("{address}.{worker}")
         };
+        let max = max_threads();
+        let threads = threads
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=max).contains(count))
+            .with_context(|| format!("Enter a CPU thread count from 1 to {max}"))?;
         Ok(Self {
             endpoint: endpoint.to_owned(),
             address,
             user,
             password: password.to_owned(),
+            threads,
         })
     }
 }
@@ -78,6 +98,7 @@ pub struct Snapshot {
     pub total: u64,
     pub rate: u64,
     pub running: bool,
+    pub threads: usize,
     pub accepted: u64,
     pub rejected: u64,
     pub network_hits: u64,
@@ -87,7 +108,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(best: Option<Best>) -> Self {
+    fn new(best: Option<Best>, threads: usize) -> Self {
         Self {
             status: "Connecting…".into(),
             message: "Space starts or pauses automatic mining. N tests a nonce.".into(),
@@ -97,6 +118,7 @@ impl Snapshot {
             total: 0,
             rate: 0,
             running: false,
+            threads,
             accepted: 0,
             rejected: 0,
             network_hits: 0,
@@ -122,7 +144,7 @@ impl Connection {
 
 pub fn start(config: Config, storage: Storage, best: Option<Best>) -> Connection {
     let (sender, commands) = mpsc::channel();
-    let snapshot = Snapshot::new(best);
+    let snapshot = Snapshot::new(best, config.threads);
     let shared = Arc::new(Mutex::new(snapshot.clone()));
     let published = Arc::clone(&shared);
     let thread = std::thread::spawn(move || {
@@ -134,7 +156,7 @@ pub fn start(config: Config, storage: Storage, best: Option<Best>) -> Connection
             storage,
             best_dirty: false,
             automatic: false,
-            next_nonce: Some(0),
+            next_nonce: 0,
             submitted: HashSet::new(),
         };
         engine.run();
@@ -154,7 +176,7 @@ struct Engine {
     storage: Storage,
     best_dirty: bool,
     automatic: bool,
-    next_nonce: Option<u32>,
+    next_nonce: u64,
     submitted: HashSet<(Vec<u8>, u32)>,
 }
 
@@ -212,6 +234,7 @@ impl Engine {
     fn session(&mut self) -> Result<()> {
         let mut socket = Stratum::connect(&self.config.endpoint)?;
         let subscribe = socket.call("mining.subscribe", json!(["bitcoin-detailed/0.1"]))?;
+        let workers = CpuWorkers::new(self.config.threads)?;
         let mut authorize = None;
         let mut authorized = false;
         let mut extranonce1 = Vec::new();
@@ -387,7 +410,13 @@ impl Engine {
                             .as_ref()
                             .is_some_and(|work| Arc::ptr_eq(work, &shown))
                         {
-                            self.attempt(&shown, nonce, &mut socket, &mut shares)?;
+                            let attempt = shown.try_nonce(nonce);
+                            self.snapshot.last = Some(attempt);
+                            self.snapshot.total += 1;
+                            self.record_best(&shown, attempt, None);
+                            if attempt.hash <= shown.job.submission_target() {
+                                self.submit(&shown, nonce, attempt.hash, &mut socket, &mut shares)?;
+                            }
                         } else {
                             self.snapshot.message =
                                 "The job changed. Press N to try a nonce on the new job.".into();
@@ -420,24 +449,31 @@ impl Engine {
             if self.snapshot.running
                 && let Some(mut work) = self.snapshot.work.clone()
             {
-                for _ in 0..16_384 {
-                    if self.next_nonce.is_none() {
-                        let mut nonce2 = work.extranonce2.clone();
-                        if !mining::increment(&mut nonce2) {
-                            self.automatic = false;
-                            self.snapshot.running = false;
-                            self.snapshot.message =
-                                "Nonce space exhausted. Waiting for a new job.".into();
-                            break;
-                        }
+                if self.next_nonce == NONCE_SPACE {
+                    let mut nonce2 = work.extranonce2.clone();
+                    if mining::increment(&mut nonce2) {
                         work =
                             Arc::new(Work::new(work.job.clone(), &extranonce1, nonce2, &payout)?);
                         self.snapshot.work = Some(work.clone());
-                        self.next_nonce = Some(0);
+                        self.next_nonce = 0;
+                    } else {
+                        self.automatic = false;
+                        self.snapshot.running = false;
+                        self.snapshot.message =
+                            "Nonce space exhausted. Waiting for a new job.".into();
                     }
-                    let nonce = self.next_nonce.unwrap();
-                    self.attempt(&work, nonce, &mut socket, &mut shares)?;
-                    self.next_nonce = nonce.checked_add(1);
+                }
+                if self.snapshot.running {
+                    let best_limit = self.snapshot.best.as_ref().map(|best| best.hash);
+                    let batch = workers.scan(&work, &mut self.next_nonce, best_limit)?;
+                    self.snapshot.last = Some(batch.last);
+                    self.snapshot.total += batch.count;
+                    if let Some((attempt, timestamp)) = batch.best {
+                        self.record_best(&work, attempt, Some(timestamp));
+                    }
+                    for (nonce, hash) in batch.solutions {
+                        self.submit(&work, nonce, hash, &mut socket, &mut shares)?;
+                    }
                 }
             }
 
@@ -462,7 +498,7 @@ impl Engine {
         self.snapshot.txids = None;
         self.snapshot.tx_status = "Press T to request the TXIDs for this job.".into();
         self.submitted.clear();
-        self.next_nonce = Some(0);
+        self.next_nonce = 0;
     }
 
     fn install_job(
@@ -482,16 +518,7 @@ impl Engine {
         Ok(())
     }
 
-    fn attempt(
-        &mut self,
-        work: &Work,
-        nonce: u32,
-        socket: &mut Stratum,
-        shares: &mut HashMap<u64, (bool, String)>,
-    ) -> Result<()> {
-        let attempt = work.try_nonce(nonce);
-        self.snapshot.last = Some(attempt);
-        self.snapshot.total += 1;
+    fn record_best(&mut self, work: &Work, attempt: Attempt, timestamp: Option<OffsetDateTime>) {
         if self
             .snapshot
             .best
@@ -503,20 +530,23 @@ impl Engine {
                 header: attempt.header,
                 job: work.job.id.clone(),
                 nonce2: hex::encode(&work.extranonce2),
-                recorded_at: Some(OffsetDateTime::now_utc()),
+                recorded_at: Some(timestamp.unwrap_or_else(OffsetDateTime::now_utc)),
             });
             self.best_dirty = true;
         }
-        let is_block = attempt.hash <= work.job.network_target;
-        let is_share = work
-            .job
-            .share_target
-            .is_some_and(|target| attempt.hash <= target);
-        if work.paid_sats > 0
-            && (is_block || is_share)
-            && self.submitted.insert((work.extranonce2.clone(), nonce))
-        {
-            let hash = hex::encode(attempt.hash);
+    }
+
+    fn submit(
+        &mut self,
+        work: &Work,
+        nonce: u32,
+        hash: Hash256,
+        socket: &mut Stratum,
+        shares: &mut HashMap<u64, (bool, String)>,
+    ) -> Result<()> {
+        let is_block = hash <= work.job.network_target;
+        if work.paid_sats > 0 && self.submitted.insert((work.extranonce2.clone(), nonce)) {
+            let hash = hex::encode(hash);
             if is_block {
                 self.snapshot.network_hits += 1;
                 self.snapshot.candidate = Some(format!("Network target met: {hash}"));

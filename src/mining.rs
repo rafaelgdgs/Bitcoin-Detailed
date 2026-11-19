@@ -25,6 +25,11 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn submission_target(&self) -> Hash256 {
+        self.share_target
+            .map_or(self.network_target, |share| share.max(self.network_target))
+    }
+
     pub fn parse(params: &Value, share: Option<&(String, Hash256)>) -> Result<Self> {
         let field = |n: usize| {
             params[n]
@@ -77,7 +82,8 @@ pub struct Work {
     pub paid_sats: u64,
     pub payout_script: ScriptBuf,
     pub path: Vec<Hash256>,
-    pub header: [u8; 80],
+    header: [u8; 80],
+    midstate: Sha256,
 }
 
 impl Work {
@@ -129,6 +135,10 @@ impl Work {
         header[68..72].copy_from_slice(&job.time.to_le_bytes());
         header[72..76].copy_from_slice(&job.bits.to_le_bytes());
 
+        // The nonce lives in the second SHA-256 block. Cache the first block's state.
+        let mut midstate = Sha256::new();
+        midstate.update(&header[..64]);
+
         Ok(Self {
             job,
             extranonce1: extranonce1.to_vec(),
@@ -139,6 +149,7 @@ impl Work {
             payout_script: payout.to_owned(),
             path,
             header,
+            midstate,
         })
     }
 
@@ -169,15 +180,30 @@ impl Work {
     }
 
     pub fn try_nonce(&self, nonce: u32) -> Attempt {
-        let mut header = self.header;
-        header[76..80].copy_from_slice(&nonce.to_le_bytes());
-        let first = Sha256::digest(header).into();
+        self.attempt(nonce, self.hash_nonce(nonce))
+    }
+
+    pub fn header(&self) -> [u8; 80] {
+        self.header
+    }
+
+    #[inline]
+    pub fn hash_nonce(&self, nonce: u32) -> NonceHash {
+        let mut tail: [u8; 16] = self.header[64..].try_into().unwrap();
+        tail[12..].copy_from_slice(&nonce.to_le_bytes());
+        let first = self.midstate.clone().chain_update(tail).finalize().into();
         let mut hash: Hash256 = Sha256::digest(first).into();
         hash.reverse();
+        NonceHash { first, hash }
+    }
+
+    pub fn attempt(&self, nonce: u32, result: NonceHash) -> Attempt {
+        let mut header = self.header;
+        header[76..80].copy_from_slice(&nonce.to_le_bytes());
         Attempt {
             header,
-            first,
-            hash,
+            first: result.first,
+            hash: result.hash,
         }
     }
 
@@ -204,6 +230,12 @@ impl Work {
             .sum();
         self.coinbase_bytes.len() - 4 - witness_len - outputs_len
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct NonceHash {
+    first: Hash256,
+    pub hash: Hash256,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -358,6 +390,25 @@ mod tests {
             &work.coinbase_bytes[work.payout_offset() + 9..][..script.len()],
             script.as_bytes()
         );
+        let next = Work::new(
+            work.job.clone(),
+            &work.extranonce1,
+            vec![work.extranonce2[0].wrapping_add(1)],
+            script,
+        )?;
+        assert_ne!(&next.header[..64], &work.header[..64]);
+        for work in [work, next] {
+            for nonce in [0, 2_573_394_689, u32::MAX] {
+                let attempt = work.try_nonce(nonce);
+                assert_eq!(
+                    attempt.first,
+                    <[u8; 32]>::from(Sha256::digest(attempt.header))
+                );
+                let mut expected = hash256(&attempt.header);
+                expected.reverse();
+                assert_eq!(attempt.hash, expected);
+            }
+        }
         Ok(())
     }
 

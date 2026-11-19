@@ -10,6 +10,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::mining::{self, Hash256};
 
 pub const FILE_NAME: &str = "bitcoin-detailed.json";
+pub type SetupForm = [String; 5];
 const DEFAULT_POOL: &str = "stratum.ckpool.org:3333";
 const LEGACY_BEST: &str = ".bitcoin-detailed-best.json";
 
@@ -60,14 +61,20 @@ impl Best {
 }
 
 pub struct SavedState {
-    pub form: [String; 4],
+    pub form: SetupForm,
     pub best: Option<Best>,
 }
 
 impl Default for SavedState {
     fn default() -> Self {
         Self {
-            form: [DEFAULT_POOL.into(), String::new(), "tui".into(), "x".into()],
+            form: [
+                DEFAULT_POOL.into(),
+                String::new(),
+                "tui".into(),
+                "x".into(),
+                "1".into(),
+            ],
             best: None,
         }
     }
@@ -136,7 +143,7 @@ impl Storage {
         Ok(state)
     }
 
-    pub fn save_settings(&self, form: &[String; 4]) -> Result<SavedState> {
+    pub fn save_settings(&self, form: &SetupForm) -> Result<SavedState> {
         self.update(|state| state.form.clone_from(form))
     }
 
@@ -162,13 +169,14 @@ impl Storage {
         lock.lock()?;
         let mut state = self.load()?;
         apply(&mut state);
-        let [pool, address, worker, password] = &state.form;
+        let [pool, address, worker, password, threads] = &state.form;
         let document = json!({
             "settings": {
                 "pool": pool,
                 "address": address,
                 "worker": worker,
                 "password": password,
+                "threads": threads.trim().parse::<u64>().context("Invalid saved thread count")?,
             },
             "best": state.best.as_ref().map(Best::to_json).transpose()?,
         });
@@ -177,7 +185,7 @@ impl Storage {
     }
 }
 
-fn read_form(document: &Value, mut form: [String; 4]) -> Result<[String; 4]> {
+fn read_form(document: &Value, mut form: SetupForm) -> Result<SetupForm> {
     let settings = document
         .as_object()
         .context("Settings must be a JSON object")?;
@@ -191,6 +199,12 @@ fn read_form(document: &Value, mut form: [String; 4]) -> Result<[String; 4]> {
                 .with_context(|| format!("Setting {key} must be a string"))?
                 .to_owned();
         }
+    }
+    if let Some(threads) = settings.get("threads") {
+        form[4] = threads
+            .as_u64()
+            .map(|count| count.to_string())
+            .context("Setting threads must be a nonnegative integer")?;
     }
     Ok(form)
 }
@@ -275,6 +289,7 @@ mod tests {
             let mut form = storage.load()?.form;
             assert_eq!(form[0], "127.0.0.1:3333");
             assert_eq!(form[2], "old-worker");
+            assert_eq!(form[4], "1");
             let imported = storage
                 .save_settings(&form)?
                 .best
@@ -283,6 +298,7 @@ mod tests {
             assert_eq!(imported.recorded_at, None);
 
             form[2] = "new-worker".into();
+            form[4] = "6".into();
             std::thread::scope(|scope| -> Result<()> {
                 let settings_write = scope.spawn(|| storage.save_settings(&form));
                 storage.save_best(&better)?;

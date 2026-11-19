@@ -18,7 +18,7 @@ use time::UtcOffset;
 
 use crate::engine::{self, Command, Config, Connection, Snapshot};
 use crate::mining::{self, Hash256, Work};
-use crate::storage::{Best, FILE_NAME, SavedState, Storage};
+use crate::storage::{Best, FILE_NAME, SavedState, SetupForm, Storage};
 
 const GOLD: Color = Color::Rgb(255, 189, 91);
 const MINT: Color = Color::Rgb(109, 224, 180);
@@ -53,7 +53,7 @@ pub fn run() -> Result<()> {
 }
 
 struct App {
-    form: [String; 4],
+    form: SetupForm,
     storage: Storage,
     initial_best: Option<Best>,
     field: usize,
@@ -224,8 +224,10 @@ impl App {
                     self.form[self.field].pop();
                 }
                 KeyCode::Enter => {
-                    match Config::new(&self.form[0], &self.form[1], &self.form[2], &self.form[3]) {
+                    let [pool, address, worker, password, threads] = &self.form;
+                    match Config::new(pool, address, worker, password, threads) {
                         Ok(config) => {
+                            self.form[4] = config.threads.to_string();
                             let best = match self.storage.save_settings(&self.form) {
                                 Ok(state) => {
                                     self.notice.clear();
@@ -429,11 +431,13 @@ impl App {
             label("Bitcoin Detailed"),
             Line::raw("Solo CPU mining with live Bitcoin mainnet jobs from the pool."),
         ];
+        let thread_label = format!("CPU threads (1–{})", engine::max_threads());
         for (i, name) in [
             "Stratum V1 TCP pool",
             "Public Bitcoin address",
             "Worker (optional)",
             "Pool password",
+            &thread_label,
         ]
         .iter()
         .enumerate()
@@ -469,11 +473,15 @@ impl App {
 
     fn dashboard(&self, snapshot: &Snapshot) -> Lines {
         let mut lines = vec![
-            label(if snapshot.running {
-                "MINING ON CPU"
-            } else {
-                "MINING PAUSED"
-            }),
+            label(format!(
+                "{} · Threads: {}",
+                if snapshot.running {
+                    "MINING ON CPU"
+                } else {
+                    "MINING PAUSED"
+                },
+                snapshot.threads
+            )),
             Line::raw(format!(
                 "{} H/s · {} attempts · {} shares accepted / {} rejected · {} block candidates",
                 snapshot.rate,
@@ -537,10 +545,13 @@ impl App {
         let header = &snapshot
             .last
             .as_ref()
-            .map_or(work.header, |attempt| attempt.header);
+            .map_or_else(|| work.header(), |attempt| attempt.header);
         let mut lines = vec![
             label("The 80 bytes that go into SHA-256"),
             Line::raw("Offsets are decimal. Values appear in serialized header byte order."),
+            Line::raw(
+                "The miner reuses the SHA-256 state after the first 64 bytes for each nonce.",
+            ),
         ];
         for (start, end, name, explanation) in [
             (
