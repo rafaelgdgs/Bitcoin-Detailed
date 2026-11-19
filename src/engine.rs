@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -8,11 +7,11 @@ use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Network, Txid};
 use serde_json::{Value, json};
 use std::str::FromStr;
+use time::OffsetDateTime;
 
-use crate::mining::{self, Attempt, Hash256, Job, Work};
+use crate::mining::{self, Attempt, Job, Work};
+use crate::storage::{Best, Storage};
 use crate::stratum::Stratum;
-
-pub const DEFAULT_POOL: &str = "stratum.ckpool.org:3333";
 
 pub struct Config {
     pub endpoint: String,
@@ -70,48 +69,6 @@ pub enum Command {
 }
 
 #[derive(Clone)]
-pub struct Best {
-    pub hash: Hash256,
-    pub header: [u8; 80],
-    pub job: String,
-    pub nonce2: String,
-}
-
-impl Best {
-    fn read(path: &std::path::Path) -> Option<Self> {
-        let record: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        let hash: Hash256 = mining::hex_array(record["hash"].as_str()?).ok()?;
-        let header = mining::hex_array(record["header"].as_str()?).ok()?;
-        let mut computed = mining::hash256(&header);
-        computed.reverse();
-        (hash == computed).then(|| Self {
-            hash,
-            header,
-            job: record["job"].as_str().unwrap_or_default().to_owned(),
-            nonce2: record["extranonce2"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        })
-    }
-
-    fn save(&self, path: &std::path::Path) -> Result<()> {
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(
-            &temp,
-            serde_json::to_vec_pretty(&json!({
-                "hash": hex::encode(self.hash),
-                "header": hex::encode(self.header),
-                "job": self.job,
-                "extranonce2": self.nonce2,
-            }))?,
-        )?;
-        std::fs::rename(temp, path)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
 pub struct Snapshot {
     pub status: String,
     pub message: String,
@@ -163,9 +120,9 @@ impl Connection {
     }
 }
 
-pub fn start(config: Config, best_path: PathBuf) -> Connection {
+pub fn start(config: Config, storage: Storage, best: Option<Best>) -> Connection {
     let (sender, commands) = mpsc::channel();
-    let snapshot = Snapshot::new(Best::read(&best_path));
+    let snapshot = Snapshot::new(best);
     let shared = Arc::new(Mutex::new(snapshot.clone()));
     let published = Arc::clone(&shared);
     let thread = std::thread::spawn(move || {
@@ -174,7 +131,7 @@ pub fn start(config: Config, best_path: PathBuf) -> Connection {
             commands,
             published,
             snapshot,
-            best_path,
+            storage,
             best_dirty: false,
             automatic: false,
             next_nonce: Some(0),
@@ -194,7 +151,7 @@ struct Engine {
     commands: mpsc::Receiver<Command>,
     published: Arc<Mutex<Snapshot>>,
     snapshot: Snapshot,
-    best_path: PathBuf,
+    storage: Storage,
     best_dirty: bool,
     automatic: bool,
     next_nonce: Option<u32>,
@@ -210,9 +167,14 @@ impl Engine {
         if self.best_dirty
             && let Some(best) = &self.snapshot.best
         {
-            self.best_dirty = false;
-            if let Err(error) = best.save(&self.best_path) {
-                self.snapshot.message = format!("Could not save the best hash: {error}");
+            match self.storage.save_best(best) {
+                Ok(state) => {
+                    self.best_dirty = false;
+                    self.snapshot.best = state.best;
+                }
+                Err(error) => {
+                    self.snapshot.message = format!("Could not save the best hash: {error:#}");
+                }
             }
         }
     }
@@ -534,6 +496,7 @@ impl Engine {
                 header: attempt.header,
                 job: work.job.id.clone(),
                 nonce2: hex::encode(&work.extranonce2),
+                recorded_at: Some(OffsetDateTime::now_utc()),
             });
             self.best_dirty = true;
         }

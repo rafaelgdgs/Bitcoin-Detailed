@@ -12,6 +12,10 @@ cargo run --release
 
 The default endpoint is `stratum.ckpool.org:3333` ([Solo CKPool](https://solo.ckpool.org/)). Paste your **public Bitcoin mainnet address** for payouts and press **Enter**. The worker name is optional. CKPool accepts `x` as the password. To use a different pool, enter a Stratum V1 TCP endpoint that supports solo mining with direct coinbase payouts.
 
+Pressing **Enter** saves the pool endpoint, public address, worker, and pool password in `bitcoin-detailed.json` next to the executable. The same file holds the best hash, its discovery time in UTC, and the header that produced it. The next launch starts with the form filled in, regardless of the working directory. The file stores the pool password as plain text and is created with owner-only permissions on Unix.
+
+When upgrading, launch once from the directory where you previously ran the miner to import its old best-hash file. The app also looks for that file next to the executable and imports settings from the previous user config location. If you run through Cargo, the executable and the JSON are in `target/debug` or `target/release`; keep a copy of the JSON before running `cargo clean`.
+
 Mining starts paused. The **Coinbase** tab shows the output that matches your address, its value in satoshis, and the offset of its script in the transaction. Automatic mining and submissions require a positive payout to that address. You can inspect jobs and test nonces locally regardless.
 
 | Key | Action |
@@ -25,7 +29,7 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 | Enter / Esc in Transactions | Look up the selected transaction in Esplora or return to the list |
 | Q, Ctrl+C | Quit |
 
-The miner sends every qualifying attempt, manual or automatic, via `mining.submit`. The share target measures work for the pool. The network target, decoded from `nBits`, sets the proof-of-work threshold for a block candidate. Even after the pool accepts a candidate, the network must accept the block for a payout. A CPU has an extremely small chance of hitting that target. The best hash and the header that produced it are saved in `.bitcoin-detailed-best.json` in the working directory.
+The miner sends every qualifying attempt, manual or automatic, via `mining.submit`. The share target measures work for the pool. The network target, decoded from `nBits`, sets the proof-of-work threshold for a block candidate. Even after the pool accepts a candidate, the network must accept the block for a payout. A CPU has an extremely small chance of hitting that target.
 
 ## What goes into the hash
 

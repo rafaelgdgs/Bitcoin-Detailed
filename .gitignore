@@ -1,3 +1,4 @@
 /target
-/.bitcoin-detailed-best.json
-/.bitcoin-detailed-best.*.tmp
+bitcoin-detailed.json
+bitcoin-detailed.*.tmp
+.bitcoin-detailed.lock

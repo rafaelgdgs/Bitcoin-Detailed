@@ -14,9 +14,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use time::UtcOffset;
 
 use crate::engine::{self, Command, Config, Connection, Snapshot};
-use crate::mining::{self, Work};
+use crate::mining::{self, Hash256, Work};
+use crate::storage::{Best, FILE_NAME, SavedState, Storage};
 
 const GOLD: Color = Color::Rgb(255, 189, 91);
 const MINT: Color = Color::Rgb(109, 224, 180);
@@ -33,8 +35,8 @@ const TABS: [&str; 6] = [
 type Lines = Vec<Line<'static>>;
 
 pub fn run() -> Result<()> {
+    let mut app = App::new()?;
     let mut terminal = ratatui::try_init()?;
-    let mut app = App::new();
     let result = (|| {
         execute!(std::io::stdout(), EnableBracketedPaste)?;
         app.run(&mut terminal)
@@ -52,6 +54,8 @@ pub fn run() -> Result<()> {
 
 struct App {
     form: [String; 4],
+    storage: Storage,
+    initial_best: Option<Best>,
     field: usize,
     connection: Option<Connection>,
     tab: usize,
@@ -66,26 +70,31 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        Self {
-            form: [
-                engine::DEFAULT_POOL.into(),
-                String::new(),
-                "tui".into(),
-                "x".into(),
-            ],
+    fn new() -> Result<Self> {
+        let storage = Storage::for_current_exe()?;
+        let (state, notice) = match storage.load() {
+            Ok(state) => (state, String::new()),
+            Err(error) => (
+                SavedState::default(),
+                format!("Could not load saved data: {error:#}"),
+            ),
+        };
+        Ok(Self {
+            form: state.form,
+            initial_best: state.best,
+            storage,
             field: 1,
             connection: None,
             tab: 0,
             scroll: 0,
             binary: false,
             manual: None,
-            notice: String::new(),
+            notice,
             tx_index: 0,
             selected_job: None,
             explorer: None,
             tx_detail: None,
-        }
+        })
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -217,9 +226,18 @@ impl App {
                 KeyCode::Enter => {
                     match Config::new(&self.form[0], &self.form[1], &self.form[2], &self.form[3]) {
                         Ok(config) => {
-                            self.notice.clear();
+                            let best = match self.storage.save_settings(&self.form) {
+                                Ok(state) => {
+                                    self.notice.clear();
+                                    state.best
+                                }
+                                Err(error) => {
+                                    self.notice = format!("Could not save {FILE_NAME}: {error:#}");
+                                    self.initial_best.take()
+                                }
+                            };
                             self.connection =
-                                Some(engine::start(config, ".bitcoin-detailed-best.json".into()));
+                                Some(engine::start(config, self.storage.clone(), best));
                         }
                         Err(error) => self.notice = format!("{error}"),
                     }
@@ -470,6 +488,9 @@ impl App {
         }
         let Some(work) = &snapshot.work else {
             lines.push(Line::raw("Waiting for a job from the pool."));
+            if let Some(best) = &snapshot.best {
+                self.append_best_hash(&mut lines, best);
+            }
             return lines;
         };
         lines.push(Line::raw(format!(
@@ -497,8 +518,7 @@ impl App {
             ));
         }
         if let Some(best) = &snapshot.best {
-            lines.push(label("Best recorded hash"));
-            lines.extend(value_lines(&best.hash, self.binary, None));
+            self.append_best_hash(&mut lines, best);
         }
         if let Some(last) = snapshot.last {
             lines.push(Line::raw(format!(
@@ -716,8 +736,8 @@ impl App {
             return vec![Line::raw("No attempts recorded yet.")];
         };
         let nonce = u32::from_le_bytes(best.header[76..80].try_into().unwrap());
-        let mut lines = vec![label("Lowest hash recorded in this directory")];
-        lines.extend(value_lines(&best.hash, self.binary, None));
+        let mut lines = Vec::new();
+        self.append_best_hash(&mut lines, best);
         lines.extend([
             Line::raw(format!(
                 "Job {} · nonce {nonce} (0x{nonce:08x}) · extranonce2 {}",
@@ -726,8 +746,29 @@ impl App {
             label("Header that produced this hash"),
         ]);
         bytes(&mut lines, &best.header, 0);
-        lines.push(Line::raw("Local record: .bitcoin-detailed-best.json"));
+        lines.push(Line::raw(format!(
+            "Saved in {FILE_NAME} next to the executable."
+        )));
         lines
+    }
+
+    fn append_best_hash(&self, lines: &mut Lines, best: &Best) {
+        lines.push(label(format!(
+            "Best recorded hash · difficulty {}",
+            difficulty_text(&best.hash)
+        )));
+        lines.push(Line::raw(match best.recorded_at {
+            Some(timestamp) => {
+                let utc = timestamp.to_offset(UtcOffset::UTC);
+                let (hour, minute, second) = utc.to_hms();
+                format!(
+                    "Recorded at: {} {hour:02}:{minute:02}:{second:02} UTC",
+                    utc.date()
+                )
+            }
+            None => "Recorded at: unknown (older record)".into(),
+        }));
+        lines.extend(value_lines(&best.hash, self.binary, None));
     }
 }
 
@@ -770,6 +811,17 @@ fn label(text: impl Into<String>) -> Line<'static> {
         text.into(),
         Style::new().fg(GOLD).add_modifier(Modifier::BOLD),
     )
+}
+
+fn difficulty_text(hash: &Hash256) -> String {
+    let difficulty = mining::hash_difficulty(hash);
+    if difficulty.is_infinite() {
+        "∞".into()
+    } else if (0.0001..1_000_000.0).contains(&difficulty) {
+        format!("{difficulty:.6}")
+    } else {
+        format!("{difficulty:.4e}")
+    }
 }
 
 fn value_lines(

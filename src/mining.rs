@@ -266,6 +266,10 @@ pub fn increment(bytes: &mut [u8]) -> bool {
     false
 }
 
+pub fn hash_difficulty(hash: &Hash256) -> f64 {
+    Target::from_be_bytes(*hash).difficulty_float()
+}
+
 pub fn share_target(value: &Value) -> Result<(String, Hash256)> {
     let source = match value {
         Value::Number(number) => number.to_string(),
