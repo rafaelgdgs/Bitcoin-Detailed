@@ -1,4 +1,5 @@
 mod engine;
+mod gpu;
 mod mining;
 mod storage;
 mod stratum;

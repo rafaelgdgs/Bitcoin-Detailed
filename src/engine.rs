@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use crate::mining::{self, Attempt, Hash256, Job, Work};
 use crate::storage::{Best, Storage};
 use crate::stratum::Stratum;
-use crate::workers::{Batch, CpuWorkers};
+use crate::workers::{Backend, Batch, GpuInfo, GpuStatus, Workers};
 
 type PendingShares = HashMap<u64, (bool, String)>;
 
@@ -90,6 +90,7 @@ impl Config {
 pub enum Command {
     Toggle,
     SetThreads(usize),
+    SelectBackend(Backend),
     Manual(Arc<Work>, u32),
     Txids(Arc<Work>),
     Stop,
@@ -106,6 +107,8 @@ pub struct Snapshot {
     pub rate: u64,
     pub running: bool,
     pub threads: usize,
+    pub backend: Backend,
+    pub gpu: GpuInfo,
     pub accepted: u64,
     pub rejected: u64,
     pub network_hits: u64,
@@ -126,6 +129,8 @@ impl Snapshot {
             rate: 0,
             running: false,
             threads,
+            backend: Backend::Cpu,
+            gpu: GpuInfo::default(),
             accepted: 0,
             rejected: 0,
             network_hits: 0,
@@ -206,10 +211,8 @@ impl Engine {
         }
     }
 
-    fn set_threads(&mut self, count: usize, workers: Option<&mut CpuWorkers>) {
-        if let Some(workers) = workers
-            && let Err(error) = workers.resize(count)
-        {
+    fn set_threads(&mut self, count: usize, workers: &mut Workers) {
+        if let Err(error) = workers.resize(count) {
             self.snapshot.message = format!("Could not change CPU threads: {error:#}");
             self.publish();
             return;
@@ -225,9 +228,70 @@ impl Engine {
         self.publish();
     }
 
+    fn select_backend(
+        &mut self,
+        backend: Backend,
+        workers: &Workers,
+        submission: Option<(&mut Stratum, &mut PendingShares)>,
+    ) -> Result<()> {
+        self.snapshot.gpu = workers.gpu_info();
+        if backend == self.snapshot.backend
+            && !matches!(self.snapshot.gpu.status, GpuStatus::Failed(_))
+        {
+            return Ok(());
+        }
+        if let Backend::Vulkan(index) = backend
+            && self
+                .snapshot
+                .gpu
+                .adapters
+                .as_ref()
+                .is_none_or(|adapters| index >= adapters.len())
+        {
+            self.snapshot.message = "Select a listed Vulkan GPU.".into();
+            self.publish();
+            return Ok(());
+        }
+        self.pause_workers(workers, submission)?;
+        workers.select_backend(backend);
+        self.snapshot.backend = backend;
+        self.snapshot.rate = 0;
+        self.snapshot.gpu = workers.gpu_info();
+        self.snapshot.message = match backend {
+            Backend::Cpu => "CPU mining selected.".into(),
+            Backend::Vulkan(_) => "Vulkan GPU mining selected.".into(),
+        };
+        self.publish();
+        Ok(())
+    }
+
+    fn refresh_gpu(&mut self, workers: &Workers) -> bool {
+        self.snapshot.gpu = workers.gpu_info();
+        match self.snapshot.backend {
+            Backend::Cpu => true,
+            Backend::Vulkan(_) => {
+                if let GpuStatus::Failed(error) = &self.snapshot.gpu.status
+                    && self.automatic
+                {
+                    self.automatic = false;
+                    self.snapshot.message = format!("Vulkan mining paused: {error}");
+                }
+                self.snapshot.gpu.status == GpuStatus::Ready
+            }
+        }
+    }
+
     fn run(&mut self) {
+        let mut workers = match Workers::new(self.config.threads) {
+            Ok(workers) => workers,
+            Err(error) => {
+                self.snapshot.status = format!("Could not start mining workers: {error:#}");
+                self.publish();
+                return;
+            }
+        };
         loop {
-            if let Err(error) = self.session() {
+            if let Err(error) = self.session(&mut workers) {
                 self.snapshot.status = format!("Disconnected · retrying in 5 s: {error:#}");
                 self.snapshot.running = false;
                 self.snapshot.work = None;
@@ -241,31 +305,37 @@ impl Engine {
                 return;
             }
             let until = Instant::now() + Duration::from_secs(5);
-            loop {
+            while Instant::now() < until {
+                let wait = until.saturating_duration_since(Instant::now());
                 match self
                     .commands
-                    .recv_timeout(until.saturating_duration_since(Instant::now()))
+                    .recv_timeout(wait.min(Duration::from_millis(100)))
                 {
                     Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Ok(Command::Toggle) => self.automatic = !self.automatic,
-                    Ok(Command::SetThreads(count)) => self.set_threads(count, None),
+                    Ok(Command::SetThreads(count)) => self.set_threads(count, &mut workers),
+                    Ok(Command::SelectBackend(backend)) => {
+                        // No socket is active and the previous session already drained its work.
+                        let _ = self.select_backend(backend, &workers, None);
+                    }
                     Ok(_) => {}
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
+                self.refresh_gpu(&workers);
+                self.publish();
             }
         }
     }
 
-    fn session(&mut self) -> Result<()> {
+    fn session(&mut self, workers: &mut Workers) -> Result<()> {
         let mut socket = Stratum::connect(&self.config.endpoint)?;
-        let mut workers = CpuWorkers::new(self.config.threads)?;
-        let result = self.run_session(&mut socket, &mut workers);
+        let result = self.run_session(&mut socket, workers);
         // Preserve work already computed if the connection failed during a range.
-        self.pause_workers(&workers, None)?;
+        self.pause_workers(workers, None)?;
         result
     }
 
-    fn run_session(&mut self, socket: &mut Stratum, workers: &mut CpuWorkers) -> Result<()> {
+    fn run_session(&mut self, socket: &mut Stratum, workers: &mut Workers) -> Result<()> {
         let subscribe = socket.call("mining.subscribe", json!(["bitcoin-detailed/0.1"]))?;
         let mut authorize = None;
         let mut authorized = false;
@@ -455,7 +525,15 @@ impl Engine {
                             "Mining paused.".into()
                         };
                     }
-                    Ok(Command::SetThreads(count)) => self.set_threads(count, Some(workers)),
+                    Ok(Command::SetThreads(count)) => self.set_threads(count, workers),
+                    Ok(Command::SelectBackend(backend)) => {
+                        let previous = self.snapshot.backend;
+                        self.select_backend(backend, workers, Some((socket, &mut shares)))?;
+                        if self.snapshot.backend != previous {
+                            total_at_update = self.snapshot.total;
+                            updated = Instant::now();
+                        }
+                    }
                     Ok(Command::Manual(shown, nonce)) => {
                         self.automatic = false;
                         self.pause_workers(workers, Some((socket, &mut shares)))?;
@@ -496,7 +574,9 @@ impl Engine {
                 }
             }
 
+            let backend_ready = self.refresh_gpu(workers);
             if self.automatic
+                && backend_ready
                 && let Some(work) = self.snapshot.work.clone().filter(|work| work.paid_sats > 0)
             {
                 let (batch, exhausted) = workers.drain();
@@ -551,7 +631,7 @@ impl Engine {
 
     fn install_job(
         &mut self,
-        workers: &CpuWorkers,
+        workers: &Workers,
         job: Job,
         extranonce1: &[u8],
         len: usize,
@@ -574,7 +654,7 @@ impl Engine {
 
     fn pause_workers(
         &mut self,
-        workers: &CpuWorkers,
+        workers: &Workers,
         submission: Option<(&mut Stratum, &mut PendingShares)>,
     ) -> Result<()> {
         self.snapshot.running = false;

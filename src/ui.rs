@@ -19,18 +19,22 @@ use time::UtcOffset;
 use crate::engine::{self, Command, Config, Connection, Snapshot};
 use crate::mining::{self, Hash256, Work};
 use crate::storage::{Best, FILE_NAME, SavedState, SetupForm, Storage};
+use crate::workers::{Backend, GpuStatus};
 
 const GOLD: Color = Color::Rgb(255, 189, 91);
 const MINT: Color = Color::Rgb(109, 224, 180);
 const DIM: Color = Color::Rgb(145, 153, 169);
-const TABS: [&str; 6] = [
+const TABS: [&str; 7] = [
     "1 Mine",
     "2 Header",
     "3 Coinbase",
     "4 Merkle",
     "5 Transactions",
     "6 Best",
+    "7 GPU",
 ];
+const COMPACT_TABS: [&str; 7] = ["1", "2", "3", "4", "5", "6", "7"];
+const GPU_TAB: usize = 6;
 
 type Lines = Vec<Line<'static>>;
 
@@ -55,12 +59,13 @@ pub fn run() -> Result<()> {
 enum Prompt {
     Nonce(Arc<Work>, String),
     Threads(String),
+    Device(String),
 }
 
 impl Prompt {
     fn input_mut(&mut self) -> &mut String {
         match self {
-            Self::Nonce(_, input) | Self::Threads(input) => input,
+            Self::Nonce(_, input) | Self::Threads(input) | Self::Device(input) => input,
         }
     }
 }
@@ -206,6 +211,18 @@ impl App {
                             .map(|nonce| Command::Manual(work.clone(), nonce))
                             .context("Enter an integer from 0 to 4294967295 or 0x00000000 to 0xffffffff."),
                         Prompt::Threads(input) => engine::parse_thread_count(input).map(Command::SetThreads),
+                        Prompt::Device(input) => {
+                            let count = snapshot
+                                .and_then(|snapshot| snapshot.gpu.adapters.as_deref())
+                                .map_or(0, <[_]>::len);
+                            match input.trim().parse::<usize>() {
+                                Ok(0) => Ok(Command::SelectBackend(Backend::Cpu)),
+                                Ok(number) if number <= count => {
+                                    Ok(Command::SelectBackend(Backend::Vulkan(number - 1)))
+                                }
+                                _ => Err(anyhow::anyhow!("Enter 0 for CPU or a listed GPU number.")),
+                            }
+                        }
                     };
                     match command {
                         Ok(command) => {
@@ -222,7 +239,7 @@ impl App {
                 KeyCode::Char(c) => {
                     let allowed = match prompt {
                         Prompt::Nonce(..) => c.is_ascii_hexdigit() || matches!(c, 'x' | 'X'),
-                        Prompt::Threads(_) => c.is_ascii_digit(),
+                        Prompt::Threads(_) | Prompt::Device(_) => c.is_ascii_digit(),
                     };
                     let input = prompt.input_mut();
                     if allowed && input.len() < 32 {
@@ -277,7 +294,7 @@ impl App {
             KeyCode::Char('q') => return true,
             KeyCode::Tab => self.select_tab((self.tab + 1) % TABS.len()),
             KeyCode::BackTab => self.select_tab((self.tab + TABS.len() - 1) % TABS.len()),
-            KeyCode::Char(c @ '1'..='6') => self.select_tab((c as u8 - b'1') as usize),
+            KeyCode::Char(c @ '1'..='7') => self.select_tab((c as u8 - b'1') as usize),
             KeyCode::Char(' ') => {
                 self.notice.clear();
                 self.send(Command::Toggle);
@@ -295,6 +312,11 @@ impl App {
             KeyCode::Char('c' | 'C') => {
                 self.notice.clear();
                 self.prompt = Some(Prompt::Threads(String::new()));
+            }
+            KeyCode::Char('g' | 'G') => {
+                self.select_tab(GPU_TAB);
+                self.notice.clear();
+                self.prompt = Some(Prompt::Device(String::new()));
             }
             KeyCode::Char('t') => {
                 if let Some(work) = &snapshot.work {
@@ -400,8 +422,15 @@ impl App {
             ]),
             state,
         );
+        let tab_width =
+            TABS.iter().map(|title| title.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
+        let titles = if usize::from(tabs.width) >= tab_width {
+            TABS
+        } else {
+            COMPACT_TABS
+        };
         frame.render_widget(
-            Tabs::new(TABS)
+            Tabs::new(titles)
                 .select(self.tab)
                 .highlight_style(Style::new().fg(GOLD).bold())
                 .style(Style::new().fg(DIM))
@@ -420,6 +449,7 @@ impl App {
             3 => self.merkle(snapshot),
             4 => self.transactions(snapshot, inner.height),
             5 => self.best(snapshot),
+            GPU_TAB => self.gpu(snapshot),
             _ => unreachable!(),
         };
         let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
@@ -437,8 +467,11 @@ impl App {
                 engine::max_threads(),
                 snapshot.threads
             ),
+            Some(Prompt::Device(input)) => {
+                format!(" Device number (0 = CPU)  › {input}▌  [Enter select · Esc cancel]")
+            }
             None => {
-                " 1–6/Tab tabs · Space mine/pause · C threads · N nonce · B hex/bin · T TXIDs · Q quit".into()
+                " 1–7/Tab tabs · Space mine/pause · G device · C threads · N nonce · B hex/bin · T TXIDs · Q quit".into()
             }
         };
         let message = if self.notice.is_empty() {
@@ -459,7 +492,7 @@ impl App {
     fn draw_form(&self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![
             label("Bitcoin Detailed"),
-            Line::raw("Solo CPU mining with live Bitcoin mainnet jobs from the pool."),
+            Line::raw("Solo CPU and Vulkan GPU mining with live Bitcoin mainnet jobs."),
         ];
         let thread_label = format!("CPU threads (1–{})", engine::max_threads());
         for (i, name) in [
@@ -502,15 +535,18 @@ impl App {
     }
 
     fn dashboard(&self, snapshot: &Snapshot) -> Lines {
+        let backend = match snapshot.backend {
+            Backend::Cpu => format!("Threads: {}", snapshot.threads),
+            Backend::Vulkan(index) => snapshot.gpu.adapters.as_ref().unwrap()[index].clone(),
+        };
         let mut lines = vec![
             label(format!(
-                "{} · Threads: {}",
-                if snapshot.running {
-                    "MINING ON CPU"
-                } else {
-                    "MINING PAUSED"
+                "{} · {backend}",
+                match (snapshot.running, snapshot.backend) {
+                    (true, Backend::Cpu) => "MINING ON CPU",
+                    (true, Backend::Vulkan(_)) => "MINING ON GPU",
+                    (false, _) => "MINING PAUSED",
                 },
-                snapshot.threads
             )),
             Line::raw(format!(
                 "{} H/s · {} attempts · {} shares accepted / {} rejected · {} block candidates",
@@ -564,6 +600,74 @@ impl App {
                 last.nonce(),
                 last.nonce()
             )));
+        }
+        lines
+    }
+
+    fn gpu(&self, snapshot: &Snapshot) -> Lines {
+        let device_line = |text, backend| {
+            Line::styled(
+                text,
+                if snapshot.backend == backend {
+                    Style::new().fg(MINT).bold()
+                } else {
+                    Style::new()
+                },
+            )
+        };
+        let mut lines = vec![
+            label("Mining device"),
+            device_line(
+                format!("0  CPU · {} threads", snapshot.threads),
+                Backend::Cpu,
+            ),
+        ];
+        match snapshot.gpu.adapters.as_deref() {
+            None => lines.push(Line::raw("Detecting Vulkan GPUs…")),
+            Some([]) => lines.push(Line::raw(
+                "No compatible Vulkan GPU detected. CPU mining is available.",
+            )),
+            Some(adapters) => {
+                lines.extend(adapters.iter().enumerate().map(|(index, name)| {
+                    device_line(
+                        format!("{}  {name} · Vulkan", index + 1),
+                        Backend::Vulkan(index),
+                    )
+                }));
+            }
+        }
+        lines.push(Line::raw(
+            "Press G and enter a device number. Space starts or pauses mining.",
+        ));
+        match &snapshot.gpu.status {
+            GpuStatus::Idle => {}
+            GpuStatus::Preparing => {
+                lines.push(Line::raw("Initializing the Vulkan compute shader…"))
+            }
+            GpuStatus::Ready => {
+                lines.push(label(if snapshot.running {
+                    "MINING ON GPU"
+                } else {
+                    "GPU READY · MINING PAUSED"
+                }));
+                lines.push(Line::raw(format!(
+                    "{} H/s · {} total attempts",
+                    snapshot.rate, snapshot.total
+                )));
+            }
+            GpuStatus::Failed(error) => lines.push(Line::styled(
+                format!("Vulkan error: {error}"),
+                Style::new().fg(Color::LightRed),
+            )),
+        }
+        if matches!(snapshot.backend, Backend::Vulkan(_))
+            && let Some(last) = snapshot.last
+        {
+            lines.push(label(format!(
+                "Current hash · nonce 0x{:08x}",
+                last.nonce()
+            )));
+            lines.extend(value_lines(&last.hash, self.binary, None));
         }
         lines
     }

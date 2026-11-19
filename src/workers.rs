@@ -6,11 +6,34 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
+use crate::gpu;
 use crate::mining::{Attempt, Hash256, Work};
 
 pub const NONCE_SPACE: u64 = u32::MAX as u64 + 1;
-const BATCH_SIZE: u64 = 16_384;
+const CPU_BATCH_SIZE: u64 = 16_384;
 const MAX_PENDING_SOLUTIONS: usize = 4_096;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    #[default]
+    Cpu,
+    Vulkan(usize),
+}
+
+#[derive(Clone, Default)]
+pub struct GpuInfo {
+    pub adapters: Option<Arc<[String]>>,
+    pub status: GpuStatus,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum GpuStatus {
+    #[default]
+    Idle,
+    Preparing,
+    Ready,
+    Failed(String),
+}
 
 #[derive(Default)]
 struct Scheduler {
@@ -20,6 +43,8 @@ struct Scheduler {
     pending: Option<Batch>,
     in_flight: usize,
     thread_count: usize,
+    backend: Backend,
+    gpu: GpuInfo,
     running: bool,
     stopping: bool,
 }
@@ -34,6 +59,36 @@ impl Scheduler {
             .as_ref()
             .is_some_and(|batch| batch.solutions.len() >= MAX_PENDING_SOLUTIONS)
     }
+
+    fn can_scan(&self) -> bool {
+        self.running && self.next_nonce < NONCE_SPACE && !self.backpressured()
+    }
+
+    fn reserve(&mut self, batch_size: u64) -> (Arc<Work>, Range<u64>, Option<Hash256>) {
+        let work = self
+            .work
+            .as_ref()
+            .expect("Running workers have a job")
+            .clone();
+        let start = self.next_nonce;
+        let end = (start + batch_size).min(NONCE_SPACE);
+        self.next_nonce = end;
+        self.in_flight += 1;
+        (work, start..end, self.best_limit)
+    }
+
+    fn finish(&mut self, batch: Batch) {
+        if let Some((best, _)) = &batch.best
+            && self.best_limit.is_none_or(|limit| best.hash < limit)
+        {
+            self.best_limit = Some(best.hash);
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.merge(batch);
+        } else {
+            self.pending = Some(batch);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -42,18 +97,32 @@ struct Shared {
     changed: Condvar,
 }
 
-pub struct CpuWorkers {
+pub struct Workers {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    gpu_thread: Option<JoinHandle<()>>,
 }
 
-impl CpuWorkers {
+impl Workers {
     pub fn new(count: usize) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::new(Shared::default()),
             threads: Vec::new(),
+            gpu_thread: None,
         };
         pool.resize(count)?;
+        let shared = pool.shared.clone();
+        match thread::Builder::new()
+            .name("vulkan-mining-worker".into())
+            .spawn(move || run_gpu_worker(shared))
+        {
+            Ok(worker) => pool.gpu_thread = Some(worker),
+            Err(error) => {
+                let mut state = pool.shared.scheduler.lock().unwrap();
+                state.gpu.adapters = Some(Arc::new([]));
+                state.gpu.status = GpuStatus::Failed(error.to_string());
+            }
+        }
         Ok(pool)
     }
 
@@ -62,7 +131,7 @@ impl CpuWorkers {
             let shared = self.shared.clone();
             let worker = thread::Builder::new()
                 .name(format!("mining-worker-{}", index + 1))
-                .spawn(move || run_worker(shared, index))
+                .spawn(move || run_cpu_worker(shared, index))
                 .with_context(|| format!("Could not start mining worker {}", index + 1))?;
             self.threads.push(worker);
         }
@@ -70,6 +139,21 @@ impl CpuWorkers {
         self.shared.scheduler.lock().unwrap().thread_count = count;
         self.shared.changed.notify_all();
         Ok(())
+    }
+
+    pub fn gpu_info(&self) -> GpuInfo {
+        self.shared.scheduler.lock().unwrap().gpu.clone()
+    }
+
+    pub fn select_backend(&self, backend: Backend) {
+        let mut state = self.shared.scheduler.lock().unwrap();
+        debug_assert!(!state.running && state.in_flight == 0);
+        state.backend = backend;
+        state.gpu.status = match backend {
+            Backend::Cpu => GpuStatus::Idle,
+            Backend::Vulkan(_) => GpuStatus::Preparing,
+        };
+        self.shared.changed.notify_all();
     }
 
     pub fn install(&self, work: Arc<Work>, best_limit: Option<Hash256>) {
@@ -112,60 +196,104 @@ impl CpuWorkers {
     }
 }
 
-impl Drop for CpuWorkers {
+impl Drop for Workers {
     fn drop(&mut self) {
         self.shared.scheduler.lock().unwrap().stopping = true;
         self.shared.changed.notify_all();
         for worker in self.threads.drain(..) {
             let _ = worker.join();
         }
+        if let Some(worker) = self.gpu_thread.take() {
+            let _ = worker.join();
+        }
     }
 }
 
-fn run_worker(shared: Arc<Shared>, index: usize) {
+fn run_cpu_worker(shared: Arc<Shared>, index: usize) {
     let mut state = shared.scheduler.lock().unwrap();
     loop {
         if state.stopping {
             break;
         }
-        if !state.running
-            || index >= state.thread_count
-            || state.next_nonce == NONCE_SPACE
-            || state.backpressured()
-        {
+        if state.backend != Backend::Cpu || index >= state.thread_count || !state.can_scan() {
             state = shared.changed.wait(state).unwrap();
             continue;
         }
 
-        let work = state
-            .work
-            .as_ref()
-            .expect("Running workers have a job")
-            .clone();
-        let best_limit = state.best_limit;
-        let start = state.next_nonce;
-        let end = (start + BATCH_SIZE).min(NONCE_SPACE);
-        state.next_nonce = end;
-        state.in_flight += 1;
+        let (work, range, best_limit) = state.reserve(CPU_BATCH_SIZE);
         drop(state);
 
-        let batch = scan(&work, start..end, best_limit);
+        let batch = scan(&work, range, best_limit);
         state = shared.scheduler.lock().unwrap();
-        if let Some((best, _)) = &batch.best
-            && state
-                .best_limit
-                .as_ref()
-                .is_none_or(|limit| best.hash < *limit)
-        {
-            state.best_limit = Some(best.hash);
-        }
-        if let Some(pending) = &mut state.pending {
-            pending.merge(batch);
-        } else {
-            state.pending = Some(batch);
-        }
+        state.finish(batch);
         state.in_flight -= 1;
         if state.in_flight == 0 && (!state.running || state.exhausted()) {
+            shared.changed.notify_all();
+        }
+    }
+}
+
+fn run_gpu_worker(shared: Arc<Shared>) {
+    let adapters = gpu::adapters();
+    let mut state = shared.scheduler.lock().unwrap();
+    state.gpu.adapters = Some(
+        adapters
+            .iter()
+            .map(|adapter| adapter.get_info().name)
+            .collect(),
+    );
+    let mut miner = None;
+    while !state.stopping {
+        let Backend::Vulkan(index) = state.backend else {
+            state = shared.changed.wait(state).unwrap();
+            continue;
+        };
+        if state.gpu.status == GpuStatus::Preparing {
+            drop(state);
+            let result = match miner.take() {
+                Some((previous, miner)) if previous == index => Ok(miner),
+                _ => gpu::Miner::new(&adapters[index]),
+            };
+            state = shared.scheduler.lock().unwrap();
+            if state.backend == Backend::Vulkan(index) {
+                state.gpu.status = match result {
+                    Ok(device) => {
+                        miner = Some((index, device));
+                        GpuStatus::Ready
+                    }
+                    Err(error) => GpuStatus::Failed(format!("{error:#}")),
+                };
+            }
+            continue;
+        }
+        if state.gpu.status != GpuStatus::Ready || !state.can_scan() {
+            state = shared.changed.wait(state).unwrap();
+            continue;
+        }
+
+        let (work, range, best_limit) = state.reserve(gpu::BATCH_SIZE);
+        drop(state);
+        let start = range.start;
+        let result = miner
+            .as_ref()
+            .expect("A ready GPU has a compute device")
+            .1
+            .scan(&work, range, best_limit);
+        state = shared.scheduler.lock().unwrap();
+        match result {
+            Ok(batch) => state.finish(batch),
+            Err(error) => {
+                // GPU mode has only one range in flight. A retry can start at the exact same nonce.
+                state.next_nonce = start;
+                state.running = false;
+                state.gpu.status = GpuStatus::Failed(format!("{error:#}"));
+                drop(state);
+                miner = None;
+                state = shared.scheduler.lock().unwrap();
+            }
+        }
+        state.in_flight -= 1;
+        if !state.running || state.exhausted() {
             shared.changed.notify_all();
         }
     }
@@ -176,7 +304,7 @@ pub struct Batch {
     pub last: Attempt,
     pub best: Option<(Attempt, OffsetDateTime)>,
     pub solutions: Vec<(u32, Hash256)>,
-    finished: Instant,
+    pub(crate) finished: Instant,
 }
 
 impl Batch {
@@ -265,8 +393,8 @@ mod tests {
             vec![],
             &coinbase.output[0].script_pubkey,
         )?);
-        let mut workers = CpuWorkers::new(1)?;
-        let start = NONCE_SPACE - 6 * BATCH_SIZE - 3;
+        let mut workers = Workers::new(1)?;
+        let start = NONCE_SPACE - 6 * CPU_BATCH_SIZE - 3;
         workers.install(work.clone(), None);
         workers.shared.scheduler.lock().unwrap().next_nonce = start;
         workers.resume(None);
@@ -334,7 +462,7 @@ mod tests {
         Ok(())
     }
 
-    fn wait_for_report(workers: &CpuWorkers) -> Result<(Batch, bool)> {
+    fn wait_for_report(workers: &Workers) -> Result<(Batch, bool)> {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while Instant::now() < deadline {
             let (batch, exhausted) = workers.drain();

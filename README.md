@@ -1,6 +1,6 @@
 # Bitcoin Detailed
 
-A Bitcoin mainnet solo CPU miner with a terminal interface built in Rust and Ratatui. It receives live jobs over Stratum V1 TCP, assembles block headers locally, and submits qualifying results to the pool. The pool's node maintains the blockchain, selects transactions, and broadcasts any block it finds. To run the miner, all you need is the TUI and an internet connection.
+A Bitcoin mainnet solo miner with CPU and Vulkan GPU support, built in Rust and Ratatui. It receives live jobs over Stratum V1 TCP, assembles block headers locally, and submits qualifying results to the pool. The pool's node maintains the blockchain, selects transactions, and broadcasts any block it finds.
 
 ## Run
 
@@ -22,17 +22,30 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 
 | Key | Action |
 | --- | --- |
-| Space | Start or pause automatic mining using the configured CPU threads |
+| Space | Start or pause automatic mining on the selected device |
+| G | Open the GPU tab and select a device. Enter a listed GPU number or `0` for CPU |
 | C | Change the CPU thread count without pausing or reconnecting. Press Enter to apply and save it |
 | N | Test a nonce on the displayed job. Enter decimal or hexadecimal, such as `0x1234`. The attempt pauses automatic mining |
-| 1–6, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, and Best |
+| 1–7, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, Best, and GPU |
 | B | Toggle hexadecimal and binary. In binary, 32-byte hashes and targets use four rows of eight bytes when the terminal is wide enough |
 | T | Request the job's TXIDs from the pool |
 | ↑ / ↓, PgUp / PgDn | Navigate the TXID list or scroll the tab |
 | Enter / Esc in Transactions | Look up the selected transaction in Esplora or return to the list |
 | Q, Ctrl+C | Quit |
 
-The miner sends every qualifying attempt, manual or automatic, via `mining.submit`. The share target measures work for the pool. The network target, decoded from `nBits`, sets the proof-of-work threshold for a block candidate. Even after the pool accepts a candidate, the network must accept the block for a payout. A CPU has an extremely small chance of hitting that target.
+The miner sends every qualifying attempt, manual or automatic, via `mining.submit`. The share target measures work for the pool. The network target, decoded from `nBits`, sets the proof-of-work threshold for a block candidate. Even after the pool accepts a candidate, the network must accept the block for a payout. A CPU or GPU has an extremely small chance of hitting that target.
+
+## GPU mining
+
+On Linux and Windows, the **GPU** tab lists hardware adapters with a Vulkan compute driver. AMD, NVIDIA, and Intel use the same bundled compute shader. Install the Vulkan-capable driver for your card. The TUI handles mining and the pool connection directly. CPU mining remains available when the app finds no compatible GPU.
+
+Each session starts with CPU selected. Use **G** to select one GPU. Switching devices keeps the pool connection, current job, and nonce progress. Automatic mining uses one device at a time, and manual nonce tests run on the CPU. The GPU searches ranges of nonces with double SHA-256, then returns its last hash, best hash, and share candidates. The CPU recomputes the returned hashes before displaying the last and best hashes or submitting a share. The **Mine**, **Header**, and **Best** tabs work with results from either device.
+
+To check the shader on your Vulkan hardware, run:
+
+```sh
+cargo test --release vulkan_matches_cpu -- --ignored --nocapture
+```
 
 ## What goes into the hash
 
