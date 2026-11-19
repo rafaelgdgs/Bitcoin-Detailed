@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -243,6 +244,8 @@ fn run_gpu_worker(shared: Arc<Shared>) {
             .collect(),
     );
     let mut miner = None;
+    let mut dispatched = VecDeque::<gpu::Dispatch>::with_capacity(gpu::SLOT_COUNT);
+    let mut next_slot = 0;
     while !state.stopping {
         let Backend::Vulkan(index) = state.backend else {
             state = shared.changed.wait(state).unwrap();
@@ -266,34 +269,56 @@ fn run_gpu_worker(shared: Arc<Shared>) {
             }
             continue;
         }
-        if state.gpu.status != GpuStatus::Ready || !state.can_scan() {
+        if state.gpu.status != GpuStatus::Ready {
             state = shared.changed.wait(state).unwrap();
             continue;
         }
 
-        let (work, range, best_limit) = state.reserve(gpu::BATCH_SIZE);
-        drop(state);
-        let start = range.start;
-        let result = miner
-            .as_ref()
-            .expect("A ready GPU has a compute device")
-            .1
-            .scan(&work, range, best_limit);
+        let (_, device) = miner.as_mut().expect("A ready GPU has a compute device");
+        let (unconfirmed_start, result) = if dispatched.len() < gpu::SLOT_COUNT && state.can_scan()
+        {
+            let work = state.work.as_deref().expect("Running workers have a job");
+            let size = gpu::batch_size(work, state.best_limit);
+            let (work, range, best_limit) = state.reserve(size);
+            drop(state);
+            let start = dispatched.front().map_or(range.start, gpu::Dispatch::start);
+            let result = device
+                .submit(next_slot, work, range, best_limit)
+                .map(|dispatch| {
+                    dispatched.push_back(dispatch);
+                    next_slot = (next_slot + 1) % gpu::SLOT_COUNT;
+                    None
+                });
+            (start, result)
+        } else if let Some(dispatch) = dispatched.pop_front() {
+            drop(state);
+            (dispatch.start(), device.collect(dispatch).map(Some))
+        } else {
+            state = shared.changed.wait(state).unwrap();
+            continue;
+        };
         state = shared.scheduler.lock().unwrap();
         match result {
-            Ok(batch) => state.finish(batch),
+            Ok(None) => continue,
+            Ok(Some(batch)) => {
+                state.finish(batch);
+                state.in_flight -= 1;
+            }
             Err(error) => {
-                // GPU mode has only one range in flight. A retry can start at the exact same nonce.
-                state.next_nonce = start;
+                // Results are collected in nonce order, so only the unconfirmed suffix is retried.
+                state.next_nonce = unconfirmed_start;
+                state.in_flight = 0;
                 state.running = false;
                 state.gpu.status = GpuStatus::Failed(format!("{error:#}"));
+                shared.changed.notify_all();
                 drop(state);
+                dispatched.clear();
+                next_slot = 0;
                 miner = None;
                 state = shared.scheduler.lock().unwrap();
             }
         }
-        state.in_flight -= 1;
-        if !state.running || state.exhausted() {
+        if state.in_flight == 0 && (!state.running || state.exhausted()) {
             shared.changed.notify_all();
         }
     }

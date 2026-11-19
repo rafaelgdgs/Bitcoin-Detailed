@@ -39,12 +39,20 @@ The miner sends every qualifying attempt, manual or automatic, via `mining.submi
 
 On Linux and Windows, the **GPU** tab lists hardware adapters with a Vulkan compute driver. AMD, NVIDIA, and Intel use the same bundled compute shader. Install the Vulkan-capable driver for your card. The TUI handles mining and the pool connection directly. CPU mining remains available when the app finds no compatible GPU.
 
-Each session starts with CPU selected. Use **G** to select one GPU. Switching devices keeps the pool connection, current job, and nonce progress. Automatic mining uses one device at a time, and manual nonce tests run on the CPU. The GPU searches ranges of nonces with double SHA-256, then returns its last hash, best hash, and share candidates. The CPU recomputes the returned hashes before displaying the last and best hashes or submitting a share. The **Mine**, **Header**, and **Best** tabs work with results from either device.
+Each session starts with CPU selected. Use **G** to select one GPU. Switching devices keeps the pool connection, current job, and nonce progress. Automatic mining uses one device at a time, and manual nonce tests run on the CPU. The **Mine**, **Header**, and **Best** tabs work with results from either device.
+
+The Vulkan shader reuses the SHA-256 state through the first three rounds of the second 64-byte block. The nonce first enters in round four. Two buffer sets allow the GPU to hash one batch while the CPU reads the previous batch. Each batch covers up to 1,048,576 nonces. The miner uses smaller batches to establish the initial record or handle unusually easy share targets. The shader returns the last hash and a bitmap of nonces eligible for submission or for a new record. The CPU recomputes those hashes and checks the exact targets before updating the display or submitting a share.
 
 To check the shader on your Vulkan hardware, run:
 
 ```sh
 cargo test --release vulkan_matches_cpu -- --ignored --nocapture
+```
+
+To compare Vulkan batch and workgroup sizes on your hardware, run:
+
+```sh
+cargo test --release vulkan_benchmark_tuning -- --ignored --nocapture
 ```
 
 ## What goes into the hash
