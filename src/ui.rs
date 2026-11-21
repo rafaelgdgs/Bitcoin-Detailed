@@ -1,5 +1,5 @@
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -16,11 +16,12 @@ use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use time::UtcOffset;
 
+use crate::activity::{HISTORY_SECONDS, RECENT_SECONDS};
 use crate::engine::{self, Command, Config, Connection, Snapshot};
 use crate::gpu::Intensity;
 use crate::mining::{self, Hash256, Work};
 use crate::storage::{Best, FILE_NAME, SavedState, SetupForm, Storage};
-use crate::workers::{Backend, GpuStatus};
+use crate::workers::{Backend, GpuStatus, NONCE_SPACE};
 
 const BG: Color = Color::Rgb(13, 19, 29);
 const SURFACE: Color = Color::Rgb(21, 29, 42);
@@ -659,8 +660,11 @@ impl App {
         if let Some(candidate) = &snapshot.candidate {
             lines.push(Line::styled(candidate.clone(), Style::new().fg(MINT)));
         }
+        let now = Instant::now();
         let Some(work) = &snapshot.work else {
             lines.push(Line::raw("Waiting for a job from the pool."));
+            self.append_hash_activity(&mut lines, snapshot, now);
+            append_events(&mut lines, snapshot, now);
             if let Some(best) = &snapshot.best {
                 self.append_best_hash(&mut lines, best);
             }
@@ -672,6 +676,8 @@ impl App {
             grouped_digits(&work.paid_sats.to_string()),
             if self.binary { "Binary" } else { "Hex" }
         )));
+        lines.push(nonce_scan(snapshot.scan_tested, &work.extranonce2, width));
+        self.append_hash_activity(&mut lines, snapshot, now);
         lines.push(Line::default());
         let last = snapshot.last.as_ref().map(|attempt| &attempt.hash);
         comparison(
@@ -699,11 +705,35 @@ impl App {
                 "The pool has not set a share difficulty for this job.",
             ));
         }
+        append_events(&mut lines, snapshot, now);
         if let Some(best) = &snapshot.best {
             lines.push(Line::default());
             self.append_best_hash(&mut lines, best);
         }
         lines
+    }
+
+    fn append_hash_activity(&self, lines: &mut Lines, snapshot: &Snapshot, now: Instant) {
+        let series = snapshot.history.series(now);
+        let recent = series[HISTORY_SECONDS - RECENT_SECONDS..]
+            .iter()
+            .flatten()
+            .min();
+        lines.push(Line::default());
+        if let Some(hash) = recent {
+            lines.push(label(format!(
+                "Best sample in last {RECENT_SECONDS}s · difficulty {} · {} leading zero bits",
+                difficulty_text(hash),
+                mining::leading_zero_bits(hash)
+            )));
+            lines.extend(value_lines(hash, self.binary, None));
+        } else {
+            lines.push(Line::styled(
+                format!("Best sample in last {RECENT_SECONDS}s · waiting for a hash"),
+                Style::new().fg(DIM),
+            ));
+        }
+        lines.extend(hash_quality(series));
     }
 
     fn device(&self, snapshot: &Snapshot) -> Lines {
@@ -1009,8 +1039,9 @@ impl App {
 
     fn append_best_hash(&self, lines: &mut Lines, best: &Best) {
         lines.push(label(format!(
-            "Best recorded hash · difficulty {}",
-            difficulty_text(&best.hash)
+            "Best recorded hash · difficulty {} · {} leading zero bits",
+            difficulty_text(&best.hash),
+            mining::leading_zero_bits(&best.hash)
         )));
         lines.push(Line::raw(match best.recorded_at {
             Some(timestamp) => {
@@ -1076,6 +1107,93 @@ fn panel() -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
         .style(Style::new().fg(TEXT).bg(SURFACE))
+}
+
+fn nonce_scan(tested: u64, extranonce: &[u8], width: u16) -> Line<'static> {
+    let tested = tested.min(NONCE_SPACE);
+    let percent = tested * 10_000 / NONCE_SPACE;
+    let columns = if width >= 75 { 20 } else { 10 };
+    let filled = (tested * columns as u64 / NONCE_SPACE) as usize;
+    let extranonce = if extranonce.is_empty() {
+        "—".into()
+    } else {
+        hex::encode(extranonce)
+    };
+    Line::from(vec![
+        Span::styled("Nonce scan  ", Style::new().fg(TEXT).bold()),
+        Span::styled("█".repeat(filled), Style::new().fg(MINT)),
+        Span::styled("░".repeat(columns - filled), Style::new().fg(BORDER)),
+        Span::raw(format!(
+            "  {}.{:02}% · extranonce2 {extranonce}",
+            percent / 100,
+            percent % 100
+        )),
+    ])
+}
+
+fn hash_quality(series: [Option<Hash256>; HISTORY_SECONDS]) -> [Line<'static>; 2] {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let zeros = series.map(|hash| hash.map(|hash| mining::leading_zero_bits(&hash)));
+    let bounds = zeros.iter().flatten().copied().fold(None, |bounds, value| {
+        Some(bounds.map_or((value, value), |(low, high): (u16, u16)| {
+            (low.min(value), high.max(value))
+        }))
+    });
+    let title = match bounds {
+        Some((low, high)) if low == high => {
+            format!("Hash quality · {HISTORY_SECONDS}s · {low} leading zero bits")
+        }
+        Some((low, high)) => {
+            format!("Hash quality · {HISTORY_SECONDS}s · {low}–{high} leading zero bits")
+        }
+        None => format!("Hash quality · {HISTORY_SECONDS}s · one sample per second"),
+    };
+    let (low, high) = bounds.unwrap_or_default();
+    let chart = Line::from_iter(zeros.into_iter().enumerate().map(|(index, value)| {
+        if let Some(value) = value {
+            let level = if high == low {
+                3
+            } else {
+                usize::from((value - low) * 7 / (high - low))
+            };
+            Span::styled(
+                BARS[level].to_string(),
+                Style::new().fg(if index == HISTORY_SECONDS - 1 {
+                    MINT
+                } else {
+                    GOLD
+                }),
+            )
+        } else {
+            Span::styled("·", Style::new().fg(BORDER))
+        }
+    }));
+    [Line::styled(title, Style::new().fg(DIM)), chart]
+}
+
+fn append_events(lines: &mut Lines, snapshot: &Snapshot, now: Instant) {
+    if snapshot.events.is_empty() {
+        return;
+    }
+    lines.push(Line::default());
+    lines.push(label("Recent events"));
+    for event in snapshot.events.iter().rev() {
+        let seconds = now.saturating_duration_since(event.at).as_secs();
+        let age = match seconds {
+            0 => "now".into(),
+            1..60 => format!("{seconds}s ago"),
+            _ => format!("{}m ago", seconds / 60),
+        };
+        let count = if event.count > 1 {
+            format!(" ×{}", event.count)
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{age:>8}  "), Style::new().fg(DIM)),
+            Span::raw(format!("{}{count}", event.text)),
+        ]));
+    }
 }
 
 fn draw_metrics(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
@@ -1277,7 +1395,16 @@ fn comparison(
         difficulty_text(target)
     )))
     .chain(value_lines(target, binary, highlight));
-    let mut hash_lines = std::iter::once(label("Current hash")).chain(
+    let caption = hash.map_or_else(
+        || "Current hash".into(),
+        |value| {
+            format!(
+                "Current hash · {} leading zero bits",
+                mining::leading_zero_bits(value)
+            )
+        },
+    );
+    let mut hash_lines = std::iter::once(label(caption)).chain(
         hash.into_iter()
             .flat_map(|value| value_lines(value, binary, highlight)),
     );
@@ -1371,6 +1498,23 @@ fn transaction(tx: &Transaction, payout: Option<(&Script, usize)>) -> Lines {
 mod tests {
     use super::*;
     use bitcoin::{CompactTarget, Target};
+
+    #[test]
+    fn mining_activity_displays_scan_progress_and_leading_zero_bits() {
+        let scan = nonce_scan(NONCE_SPACE / 2, &[1, 2], 100).to_string();
+        assert!(scan.contains("50.00% · extranonce2 0102"));
+        assert_eq!(scan.matches('█').count(), 10);
+
+        let mut sample = [u8::MAX; 32];
+        sample[..2].copy_from_slice(&[0, 0x10]);
+        assert_eq!(mining::leading_zero_bits(&sample), 11);
+        assert_eq!(mining::leading_zero_bits(&[0; 32]), 256);
+        let mut series = [None; HISTORY_SECONDS];
+        series[HISTORY_SECONDS - 1] = Some(sample);
+        let [title, bars] = hash_quality(series);
+        assert!(title.to_string().contains("11 leading zero bits"));
+        assert_eq!(bars.to_string().chars().count(), HISTORY_SECONDS);
+    }
 
     #[test]
     fn network_difficulty_and_binary_rows_fit_both_comparison_layouts() {

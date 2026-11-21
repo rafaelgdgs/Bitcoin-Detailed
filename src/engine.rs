@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
+use crate::activity::{self, HashHistory, MiningEvent};
 use crate::gpu::Intensity;
 use crate::mining::{self, Attempt, Hash256, Job, Work};
 use crate::storage::{Best, Storage};
@@ -106,6 +107,9 @@ pub struct Snapshot {
     pub last: Option<Attempt>,
     pub best: Option<Best>,
     pub total: u64,
+    pub scan_tested: u64,
+    pub history: HashHistory,
+    pub events: VecDeque<MiningEvent>,
     pub rate: u64,
     pub running: bool,
     pub threads: usize,
@@ -128,6 +132,9 @@ impl Snapshot {
             last: None,
             best,
             total: 0,
+            scan_tested: 0,
+            history: HashHistory::default(),
+            events: VecDeque::new(),
             rate: 0,
             running: false,
             threads,
@@ -317,6 +324,8 @@ impl Engine {
                 self.snapshot.running = false;
                 self.snapshot.work = None;
                 self.snapshot.last = None;
+                self.snapshot.scan_tested = 0;
+                self.snapshot.history = workers.history();
                 self.snapshot.rate = 0;
                 self.snapshot.txids = None;
                 self.save_best();
@@ -503,7 +512,8 @@ impl Engine {
                     }
                     None => {
                         if let Some((is_block, hash)) = id.and_then(|id| shares.remove(&id)) {
-                            let message = if result == true && error.is_null() {
+                            let accepted = result == true && error.is_null();
+                            let message = if accepted {
                                 self.snapshot.accepted += 1;
                                 if is_block {
                                     "Block candidate accepted by the pool. Check for network confirmation.".into()
@@ -520,6 +530,12 @@ impl Engine {
                             if is_block {
                                 self.snapshot.candidate = Some(format!("{message} {hash}"));
                             }
+                            self.event(match (is_block, accepted) {
+                                (false, true) => "Share accepted",
+                                (false, false) => "Share rejected",
+                                (true, true) => "Block candidate accepted",
+                                (true, false) => "Block candidate rejected",
+                            });
                             self.snapshot.message = message;
                         }
                     }
@@ -574,6 +590,7 @@ impl Engine {
                             let attempt = shown.try_nonce(nonce);
                             self.snapshot.last = Some(attempt);
                             self.snapshot.total += 1;
+                            workers.observe_manual(attempt.hash);
                             self.record_best(&shown, attempt, None);
                             if attempt.hash <= shown.job.submission_target() {
                                 self.submit(&shown, nonce, attempt.hash, socket, &mut shares)?;
@@ -612,6 +629,7 @@ impl Engine {
                 }
                 if exhausted {
                     self.snapshot.running = false;
+                    self.event("Nonce space exhausted");
                     let mut nonce2 = work.extranonce2.clone();
                     if mining::increment(&mut nonce2) {
                         let next =
@@ -619,6 +637,7 @@ impl Engine {
                         workers.install(next.clone(), self.best_limit());
                         self.snapshot.work = Some(next);
                         self.snapshot.last = None;
+                        self.snapshot.scan_tested = 0;
                     } else {
                         self.automatic = false;
                         self.snapshot.message =
@@ -639,6 +658,7 @@ impl Engine {
                     ((self.snapshot.total - total_at_update) as f64 / elapsed.as_secs_f64()) as u64;
                 total_at_update = self.snapshot.total;
                 updated = Instant::now();
+                self.snapshot.history = workers.history();
                 self.publish();
             }
             if last_save.elapsed() >= Duration::from_secs(2) {
@@ -651,6 +671,7 @@ impl Engine {
     fn invalidate_work(&mut self) {
         self.snapshot.work = None;
         self.snapshot.last = None;
+        self.snapshot.scan_tested = 0;
         self.snapshot.txids = None;
         self.snapshot.tx_status = "Press T to request the TXIDs for this job.".into();
         self.submitted.clear();
@@ -671,6 +692,7 @@ impl Engine {
             "Mainnet job received · payout found in the coinbase".into()
         };
         workers.install(work.clone(), self.best_limit());
+        self.event(&format!("New job received · {}", work.job.id));
         self.snapshot.work = Some(work);
         Ok(())
     }
@@ -701,6 +723,7 @@ impl Engine {
     ) -> Result<()> {
         self.snapshot.last = Some(batch.last);
         self.snapshot.total += batch.count;
+        self.snapshot.scan_tested += batch.count;
         if let Some((attempt, timestamp)) = batch.best {
             self.record_best(work, attempt, Some(timestamp));
         }
@@ -727,7 +750,12 @@ impl Engine {
                 recorded_at: Some(timestamp.unwrap_or_else(OffsetDateTime::now_utc)),
             });
             self.best_dirty = true;
+            self.event("New best recorded hash");
         }
+    }
+
+    fn event(&mut self, text: &str) {
+        activity::record_event(&mut self.snapshot.events, text);
     }
 
     fn submit(

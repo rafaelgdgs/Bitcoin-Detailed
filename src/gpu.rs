@@ -22,6 +22,14 @@ const SHA256_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 const INITIAL_ROUND_CONSTANTS: [u32; 3] = [0x428a2f98, 0x71374491, 0xb5c0fbcf];
+// About one observation per full batch. The existing bitmap has room for every match.
+const OBSERVATION_TARGET: Hash256 = {
+    let mut target = [u8::MAX; 32];
+    target[0] = 0;
+    target[1] = 0;
+    target[2] = 0x0f;
+    target
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Intensity(u8);
@@ -59,11 +67,17 @@ pub fn batch_size(work: &Work, best_limit: Option<Hash256>) -> u64 {
         // Mark all nonces in a short first batch to establish an exact initial record.
         return 256;
     };
-    let threshold = work.job.submission_target().max(best);
+    let threshold = candidate_threshold(work.job.submission_target(), Some(best));
     let high = u64::from(be_words::<1>(&threshold)[0]) + 1;
     // Aim for at most 4,096 candidates when a pool sets an unusually easy target.
     // The bitset still has space for every nonce that actually qualifies.
     BATCH_SIZE.min((4_096 << 32) / high)
+}
+
+fn candidate_threshold(share_target: Hash256, best_limit: Option<Hash256>) -> Hash256 {
+    best_limit.map_or([u8::MAX; 32], |best| {
+        best.max(share_target).max(OBSERVATION_TARGET)
+    })
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -230,8 +244,7 @@ impl Miner {
                 input
             }
         };
-        let threshold =
-            best_limit.map_or([u8::MAX; 32], |best| best.max(work.job.submission_target()));
+        let threshold = candidate_threshold(work.job.submission_target(), best_limit);
         input[19] = range.start as u32;
         input[20] = count as u32;
         input[21..].copy_from_slice(&be_words::<8>(&threshold));
@@ -359,9 +372,10 @@ fn read_batch(
     );
 
     let mut best = None;
+    let mut sample = last.hash;
     let mut solutions = Vec::new();
     let target = work.job.submission_target();
-    let threshold = best_limit.map_or([u8::MAX; 32], |limit| limit.max(target));
+    let threshold = candidate_threshold(target, best_limit);
     let flags = &data[HASH_WORDS..];
     let last_index = (range.end - range.start - 1) as usize;
     let last_marked = flags[last_index / 32] & (1 << (last_index % 32)) != 0;
@@ -382,6 +396,7 @@ fn read_batch(
                 result.hash <= threshold,
                 "GPU returned a candidate above the threshold"
             );
+            sample = sample.min(result.hash);
             if result.hash <= target {
                 solutions.push((nonce, result.hash));
             }
@@ -397,6 +412,7 @@ fn read_batch(
         last,
         best,
         solutions,
+        sample,
         finished,
     })
 }
@@ -487,6 +503,10 @@ mod tests {
         assert_eq!(hex::encode(known.hash), genesis.block_hash().to_string());
         let genesis_range = nonce - 63..nonce + 67;
         let near_end = NONCE_SPACE - 393..NONCE_SPACE;
+        // This nonce crosses the observation threshold on the historic genesis header.
+        let sample_nonce = 1_085_914;
+        let sample_hash = work.try_nonce(sample_nonce).hash;
+        assert!(sample_hash <= OBSERVATION_TARGET && sample_hash > work.job.network_target);
         let equality = test_work(Some(work.hash_nonce(u32::MAX).hash))?;
         let any_share = test_work(Some([u8::MAX; 32]))?;
 
@@ -522,6 +542,11 @@ mod tests {
             );
             let bootstrap = miner.submit(1, work.clone(), near_end.clone(), None)?;
             assert_batch(&work, near_end.clone(), None, miner.collect(bootstrap)?);
+            let range = u64::from(sample_nonce)..u64::from(sample_nonce) + 2;
+            let observation = miner.submit(0, work.clone(), range, Some([0; 32]))?;
+            let batch = miner.collect(observation)?;
+            assert_eq!(batch.sample, sample_hash);
+            assert!(batch.best.is_none() && batch.solutions.is_empty());
         }
         Ok(())
     }

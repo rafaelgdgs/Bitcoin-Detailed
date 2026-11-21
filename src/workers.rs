@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
+use crate::activity::HashHistory;
 use crate::gpu;
 use crate::mining::{Attempt, Hash256, Work};
 
@@ -44,6 +45,7 @@ struct Scheduler {
     next_nonce: u64,
     best_limit: Option<Hash256>,
     pending: Option<Batch>,
+    history: HashHistory,
     in_flight: usize,
     thread_count: usize,
     backend: Backend,
@@ -81,6 +83,7 @@ impl Scheduler {
     }
 
     fn finish(&mut self, batch: Batch) {
+        self.history.observe(batch.finished, batch.sample);
         if let Some((best, _)) = &batch.best
             && self.best_limit.is_none_or(|limit| best.hash < limit)
         {
@@ -147,6 +150,19 @@ impl Workers {
 
     pub fn gpu_info(&self) -> GpuInfo {
         self.shared.scheduler.lock().unwrap().gpu.clone()
+    }
+
+    pub fn history(&self) -> HashHistory {
+        self.shared.scheduler.lock().unwrap().history.clone()
+    }
+
+    pub fn observe_manual(&self, hash: Hash256) {
+        self.shared
+            .scheduler
+            .lock()
+            .unwrap()
+            .history
+            .observe(Instant::now(), hash);
     }
 
     pub fn set_gpu_intensity(&self, intensity: gpu::Intensity) {
@@ -394,6 +410,7 @@ pub struct Batch {
     pub last: Attempt,
     pub best: Option<(Attempt, OffsetDateTime)>,
     pub solutions: Vec<(u32, Hash256)>,
+    pub(crate) sample: Hash256,
     pub(crate) finished: Instant,
 }
 
@@ -412,6 +429,7 @@ impl Batch {
         {
             self.best = Some((attempt, timestamp));
         }
+        self.sample = self.sample.min(other.sample);
         self.solutions.append(&mut other.solutions);
     }
 }
@@ -421,6 +439,7 @@ fn scan(work: &Work, range: Range<u64>, mut best_limit: Option<Hash256>) -> Batc
     let last_nonce = (range.end - 1) as u32;
     let target = work.job.submission_target();
     let mut best = None;
+    let mut sample = [u8::MAX; 32];
     let mut solutions = Vec::new();
     let mut nonces = range.map(|nonce| nonce as u32);
     let last = loop {
@@ -431,9 +450,12 @@ fn scan(work: &Work, range: Range<u64>, mut best_limit: Option<Hash256>) -> Batc
         if result.hash <= target {
             solutions.push((nonce, result.hash));
         }
-        if best_limit.as_ref().is_none_or(|best| result.hash < *best) {
-            best_limit = Some(result.hash);
-            best = Some((work.attempt(nonce, result), OffsetDateTime::now_utc()));
+        if result.hash <= sample {
+            sample = result.hash;
+            if best_limit.as_ref().is_none_or(|best| result.hash < *best) {
+                best_limit = Some(result.hash);
+                best = Some((work.attempt(nonce, result), OffsetDateTime::now_utc()));
+            }
         }
         if nonce == last_nonce {
             break work.attempt(nonce, result);
@@ -444,6 +466,7 @@ fn scan(work: &Work, range: Range<u64>, mut best_limit: Option<Hash256>) -> Batc
         last,
         best,
         solutions,
+        sample,
         finished: Instant::now(),
     }
 }

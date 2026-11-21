@@ -38,6 +38,8 @@ The miner sends every qualifying attempt, manual or automatic, via `mining.submi
 
 The **Mine** tab shows the network difficulty derived from the job's `nBits`, alongside the network target and the current hash. On wide terminals the two values appear side by side, with the first differing byte highlighted in each. The **Header** tab also shows the difficulty next to the compact target.
 
+The **Nonce scan** bar counts completed automatic attempts in the current 32-bit nonce space. It starts over when the miner changes the job or advances extranonce2. The **Best sample in last 10s** shows the lowest observed hash in that window. The **Hash quality** chart plots the leading zero bits of each second's best sample over the last 30 seconds, with the latest sample at the right and dots for seconds without samples. The **Recent events** list shows pool jobs, completed scans, share responses, and new records.
+
 ## GPU mining
 
 On Linux and Windows, the **DEVICE** tab lists hardware adapters with a Vulkan compute driver. AMD, NVIDIA, and Intel use the same bundled compute shader. Install the Vulkan-capable driver for your card. The TUI handles mining and the pool connection directly. CPU mining remains available when the app finds no compatible GPU.
@@ -46,7 +48,7 @@ Each session starts with CPU selected. Use **G** to select one GPU. Switching de
 
 Press **I** to set GPU intensity while mining. At **50%**, the miner waits for about as long as each burst took before submitting more work. Lower values leave more idle time between bursts. The percentage controls the miner's duty cycle. Actual draw, temperature, and hashrate depend on the GPU and its driver. The default is **100%**, and the app remembers your selection in `bitcoin-detailed.json`.
 
-The Vulkan shader reuses the SHA-256 state through the first three rounds of the second 64-byte block. The nonce first enters in round four. Two buffer sets allow the GPU to hash one batch while the CPU reads the previous batch. Each batch covers up to 1,048,576 nonces. The miner uses smaller batches to establish the initial record or handle unusually easy share targets. The shader returns the last hash and a bitmap of nonces eligible for submission or for a new record. The CPU recomputes those hashes and checks the exact targets before updating the display or submitting a share.
+The Vulkan shader reuses the SHA-256 state through the first three rounds of the second 64-byte block. The nonce first enters in round four. Two buffer sets allow the GPU to hash one batch while the CPU reads the previous batch. Each batch covers up to 1,048,576 nonces. The miner uses smaller batches to establish the initial record or handle unusually easy share targets. The shader returns the last hash and a bitmap of nonces eligible for submission, for a new record, or for the recent history. For the history, the miner observes hashes with at least 20 leading zero bits and the last hash of each batch. The CPU recomputes the reported hashes and checks the exact targets before updating the display or submitting a share.
 
 To check the shader on your Vulkan hardware, run:
 

@@ -302,6 +302,17 @@ pub fn hash_difficulty(hash: &Hash256) -> f64 {
     Target::from_be_bytes(*hash).difficulty_float()
 }
 
+pub fn leading_zero_bits(hash: &Hash256) -> u16 {
+    let mut count = 0;
+    for byte in hash {
+        count += byte.leading_zeros() as u16;
+        if *byte != 0 {
+            break;
+        }
+    }
+    count
+}
+
 pub fn share_target(value: &Value) -> Result<(String, Hash256)> {
     let source = match value {
         Value::Number(number) => number.to_string(),
