@@ -32,6 +32,12 @@ const DIM: Color = Color::Rgb(159, 174, 194);
 const GOLD: Color = Color::Rgb(255, 190, 107);
 const MINT: Color = Color::Rgb(115, 227, 182);
 const RED: Color = Color::Rgb(255, 139, 145);
+const SECTION_GAP: u16 = 4;
+const CHART_AXIS: u16 = 4;
+const CHART_MIN_WIDTH: u16 = HISTORY_SECONDS as u16 + CHART_AXIS;
+const CHART_ROW_BITS: u16 = 8;
+const CHART_ROWS: u16 = 8;
+const CHART_MAX_BITS: u16 = CHART_ROW_BITS * CHART_ROWS;
 const TABS: [&str; 7] = [
     "1 Mine",
     "2 Header",
@@ -498,7 +504,7 @@ impl App {
             .padding(Padding::horizontal(u16::from(body.width >= 76)));
         let mut inner = border.inner(body);
         frame.render_widget(border, body);
-        let show_metrics = self.tab == 0 && inner.width >= 80 && inner.height >= 13;
+        let show_metrics = self.tab == 0 && inner.width >= 80 && inner.height >= 19;
         if show_metrics {
             let [metrics, content] =
                 Layout::vertical([Constraint::Length(5), Constraint::Fill(1)]).areas(inner);
@@ -511,7 +517,7 @@ impl App {
             2 => self.coinbase(snapshot),
             3 => self.merkle(snapshot),
             4 => self.transactions(snapshot, inner.height),
-            5 => self.best(snapshot),
+            5 => self.best(snapshot, inner.width),
             DEVICE_TAB => self.device(snapshot),
             _ => unreachable!(),
         };
@@ -663,11 +669,12 @@ impl App {
         let now = Instant::now();
         let Some(work) = &snapshot.work else {
             lines.push(Line::raw("Waiting for a job from the pool."));
-            self.append_hash_activity(&mut lines, snapshot, now);
-            append_events(&mut lines, snapshot, now);
             if let Some(best) = &snapshot.best {
-                self.append_best_hash(&mut lines, best);
+                lines.push(Line::default());
+                lines.extend(self.best_hash(best, width));
             }
+            self.append_hash_activity(&mut lines, snapshot, now, width);
+            append_events(&mut lines, snapshot, now);
             return lines;
         };
         lines.push(Line::raw(format!(
@@ -677,7 +684,8 @@ impl App {
             if self.binary { "Binary" } else { "Hex" }
         )));
         lines.push(nonce_scan(snapshot.scan_tested, &work.extranonce2, width));
-        self.append_hash_activity(&mut lines, snapshot, now);
+        self.append_share_and_best(&mut lines, snapshot, work, width);
+        self.append_hash_activity(&mut lines, snapshot, now, width);
         lines.push(Line::default());
         let last = snapshot.last.as_ref().map(|attempt| &attempt.hash);
         comparison(
@@ -693,47 +701,78 @@ impl App {
                 Style::new().fg(DIM),
             ));
         }
-        lines.push(Line::default());
-        if let Some(target) = &work.job.share_target {
-            lines.push(label(format!(
-                "Share target · difficulty {}",
-                work.job.share_difficulty.as_deref().unwrap_or("—")
-            )));
-            lines.extend(value_lines(target, self.binary, None));
-        } else {
-            lines.push(Line::raw(
-                "The pool has not set a share difficulty for this job.",
-            ));
-        }
         append_events(&mut lines, snapshot, now);
-        if let Some(best) = &snapshot.best {
-            lines.push(Line::default());
-            self.append_best_hash(&mut lines, best);
-        }
         lines
     }
 
-    fn append_hash_activity(&self, lines: &mut Lines, snapshot: &Snapshot, now: Instant) {
+    fn append_share_and_best(
+        &self,
+        lines: &mut Lines,
+        snapshot: &Snapshot,
+        work: &Work,
+        width: u16,
+    ) {
+        let split = hash_pair_split(width, self.binary);
+        let column = split.unwrap_or(width);
+        let mut share = vec![label("Share target")];
+        if let Some(target) = &work.job.share_target {
+            share.push(Line::raw(format!(
+                "Difficulty {}",
+                work.job.share_difficulty.as_deref().unwrap_or("—")
+            )));
+            share.extend(hash_lines(target, self.binary, column, None));
+        } else {
+            share.push(Line::styled(
+                "Waiting for share difficulty",
+                Style::new().fg(DIM),
+            ));
+        }
+        let best = snapshot.best.as_ref().map_or_else(
+            || {
+                vec![
+                    label("Best recorded hash"),
+                    Line::styled("Waiting for a record", Style::new().fg(DIM)),
+                ]
+            },
+            |best| self.best_hash(best, column),
+        );
+        lines.push(Line::default());
+        append_sections(lines, share, best, width, split);
+    }
+
+    fn append_hash_activity(
+        &self,
+        lines: &mut Lines,
+        snapshot: &Snapshot,
+        now: Instant,
+        width: u16,
+    ) {
         let series = snapshot.history.series(now);
         let recent = series[HISTORY_SECONDS - RECENT_SECONDS..]
             .iter()
             .flatten()
             .min();
+        let split = mine_column_split(width, self.binary);
+        let sample_width = split.unwrap_or(width);
+        let chart_width = split.map_or(width, |left| width - left - SECTION_GAP);
+        let title = format!("Best sample in last {RECENT_SECONDS}s");
+        let sample = recent.map_or_else(
+            || {
+                vec![
+                    label(title.clone()),
+                    Line::styled("Waiting for a hash", Style::new().fg(DIM)),
+                ]
+            },
+            |hash| hash_section(&title, hash, self.binary, sample_width),
+        );
         lines.push(Line::default());
-        if let Some(hash) = recent {
-            lines.push(label(format!(
-                "Best sample in last {RECENT_SECONDS}s · difficulty {} · {} leading zero bits",
-                difficulty_text(hash),
-                mining::leading_zero_bits(hash)
-            )));
-            lines.extend(value_lines(hash, self.binary, None));
-        } else {
-            lines.push(Line::styled(
-                format!("Best sample in last {RECENT_SECONDS}s · waiting for a hash"),
-                Style::new().fg(DIM),
-            ));
-        }
-        lines.extend(hash_quality(series));
+        append_sections(
+            lines,
+            sample,
+            hash_quality(series, chart_width),
+            width,
+            split,
+        );
     }
 
     fn device(&self, snapshot: &Snapshot) -> Lines {
@@ -1016,13 +1055,12 @@ impl App {
         lines
     }
 
-    fn best(&self, snapshot: &Snapshot) -> Lines {
+    fn best(&self, snapshot: &Snapshot, width: u16) -> Lines {
         let Some(best) = &snapshot.best else {
             return vec![Line::raw("No attempts recorded yet.")];
         };
         let nonce = u32::from_le_bytes(best.header[76..80].try_into().unwrap());
-        let mut lines = Vec::new();
-        self.append_best_hash(&mut lines, best);
+        let mut lines = self.best_hash(best, width);
         lines.extend([
             Line::raw(format!(
                 "Job {} · nonce {nonce} (0x{nonce:08x}) · extranonce2 {}",
@@ -1037,13 +1075,9 @@ impl App {
         lines
     }
 
-    fn append_best_hash(&self, lines: &mut Lines, best: &Best) {
-        lines.push(label(format!(
-            "Best recorded hash · difficulty {} · {} leading zero bits",
-            difficulty_text(&best.hash),
-            mining::leading_zero_bits(&best.hash)
-        )));
-        lines.push(Line::raw(match best.recorded_at {
+    fn best_hash(&self, best: &Best, width: u16) -> Lines {
+        let mut lines = hash_section("Best recorded hash", &best.hash, self.binary, width);
+        let timestamp = match best.recorded_at {
             Some(timestamp) => {
                 let local = UtcOffset::local_offset_at(timestamp)
                     .ok()
@@ -1058,13 +1092,23 @@ impl App {
                     offset.strip_suffix(":00").unwrap_or(&offset).to_owned()
                 };
                 format!(
-                    "Recorded at: {} {hour:02}:{minute:02}:{second:02} UTC{suffix}",
+                    "{} {hour:02}:{minute:02}:{second:02} UTC{suffix}",
                     local.date()
                 )
             }
-            None => "Recorded at: unknown (older record)".into(),
-        }));
-        lines.extend(value_lines(&best.hash, self.binary, None));
+            None => "unknown (older record)".into(),
+        };
+        let caption = "Recorded at: ";
+        if caption.len() + timestamp.len() <= usize::from(width) {
+            lines.push(Line::styled(
+                format!("{caption}{timestamp}"),
+                Style::new().fg(DIM),
+            ));
+        } else {
+            lines.push(Line::styled(caption.trim_end(), Style::new().fg(DIM)));
+            lines.push(Line::styled(timestamp, Style::new().fg(DIM)));
+        }
+        lines
     }
 }
 
@@ -1131,44 +1175,129 @@ fn nonce_scan(tested: u64, extranonce: &[u8], width: u16) -> Line<'static> {
     ])
 }
 
-fn hash_quality(series: [Option<Hash256>; HISTORY_SECONDS]) -> [Line<'static>; 2] {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let zeros = series.map(|hash| hash.map(|hash| mining::leading_zero_bits(&hash)));
-    let bounds = zeros.iter().flatten().copied().fold(None, |bounds, value| {
-        Some(bounds.map_or((value, value), |(low, high): (u16, u16)| {
-            (low.min(value), high.max(value))
-        }))
-    });
-    let title = match bounds {
-        Some((low, high)) if low == high => {
-            format!("Hash quality · {HISTORY_SECONDS}s · {low} leading zero bits")
-        }
-        Some((low, high)) => {
-            format!("Hash quality · {HISTORY_SECONDS}s · {low}–{high} leading zero bits")
-        }
-        None => format!("Hash quality · {HISTORY_SECONDS}s · one sample per second"),
+fn min_hash_width(binary: bool) -> u16 {
+    if binary { 71 } else { 32 }
+}
+
+fn mine_column_split(width: u16, binary: bool) -> Option<u16> {
+    let available = width.saturating_sub(SECTION_GAP);
+    let full_hash_width = if binary { 71 } else { 64 };
+    let left = (available / 2).clamp(min_hash_width(binary), full_hash_width);
+    (available >= left + CHART_MIN_WIDTH).then_some(left)
+}
+
+fn hash_pair_split(width: u16, binary: bool) -> Option<u16> {
+    mine_column_split(width, binary)
+        .filter(|&left| width - left - SECTION_GAP >= min_hash_width(binary))
+}
+
+fn hash_lines(
+    hash: &Hash256,
+    binary: bool,
+    width: u16,
+    highlight: Option<(usize, Style)>,
+) -> Lines {
+    let columns = if binary {
+        8
+    } else if (32..64).contains(&width) {
+        16
+    } else {
+        32
     };
-    let (low, high) = bounds.unwrap_or_default();
-    let chart = Line::from_iter(zeros.into_iter().enumerate().map(|(index, value)| {
-        if let Some(value) = value {
-            let level = if high == low {
-                3
-            } else {
-                usize::from((value - low) * 7 / (high - low))
-            };
-            Span::styled(
-                BARS[level].to_string(),
-                Style::new().fg(if index == HISTORY_SECONDS - 1 {
-                    MINT
-                } else {
-                    GOLD
-                }),
-            )
-        } else {
-            Span::styled("·", Style::new().fg(BORDER))
+    value_rows(hash, binary, columns, highlight).collect()
+}
+
+fn hash_section(title: &str, hash: &Hash256, binary: bool, width: u16) -> Lines {
+    let mut lines = vec![label(title.to_owned())];
+    let difficulty = format!("Difficulty {}", difficulty_text(hash));
+    let zeros = format!("{} leading zero bits", mining::leading_zero_bits(hash));
+    if difficulty.len() + 3 + zeros.len() <= usize::from(width) {
+        lines.push(Line::raw(format!("{difficulty} · {zeros}")));
+    } else {
+        lines.extend([Line::raw(difficulty), Line::raw(zeros)]);
+    }
+    lines.extend(hash_lines(hash, binary, width, None));
+    lines
+}
+
+fn append_sections(lines: &mut Lines, left: Lines, right: Lines, width: u16, split: Option<u16>) {
+    let Some(split) = split.filter(|&split| {
+        left.iter().all(|line| line.width() <= usize::from(split))
+            && right
+                .iter()
+                .all(|line| line.width() <= usize::from(width - split - SECTION_GAP))
+    }) else {
+        lines.extend(left);
+        lines.push(Line::default());
+        lines.extend(right);
+        return;
+    };
+
+    let rows = left.len().max(right.len());
+    let mut left = left.into_iter();
+    let mut right = right.into_iter();
+    for _ in 0..rows {
+        let mut line = left.next().unwrap_or_default();
+        line.spans
+            .push(Span::raw(" ".repeat(usize::from(split) - line.width())));
+        line.spans
+            .push(Span::styled(" │  ", Style::new().fg(BORDER)));
+        if let Some(next) = right.next() {
+            line.spans.extend(next.spans);
         }
-    }));
-    [Line::styled(title, Style::new().fg(DIM)), chart]
+        lines.push(line);
+    }
+}
+
+fn hash_quality(series: [Option<Hash256>; HISTORY_SECONDS], width: u16) -> Lines {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let spacing = if width >= CHART_AXIS + HISTORY_SECONDS as u16 * 2 {
+        " "
+    } else {
+        ""
+    };
+    let zeros = series.map(|hash| hash.map(|hash| mining::leading_zero_bits(&hash)));
+    let axis = Style::new().fg(DIM);
+    let mut lines = vec![label(format!(
+        "Hash quality · {HISTORY_SECONDS}s · zero bits"
+    ))];
+
+    for row in (0..CHART_ROWS).rev() {
+        let base = row * CHART_ROW_BITS;
+        let mut spans = vec![Span::styled(
+            format!("{:>2} │", base + CHART_ROW_BITS),
+            axis,
+        )];
+        spans.extend(zeros.iter().enumerate().map(|(index, &bits)| {
+            let segment = bits
+                .unwrap_or_default()
+                .saturating_sub(base)
+                .min(CHART_ROW_BITS);
+            let symbol = match bits {
+                Some(value) if value > CHART_MAX_BITS && row == CHART_ROWS - 1 => '↑',
+                Some(_) if segment > 0 => BARS[usize::from(segment - 1)],
+                Some(0) if row == 0 => '•',
+                None if row == 0 => '·',
+                _ => ' ',
+            };
+            let color = if bits.is_none() {
+                BORDER
+            } else if index == HISTORY_SECONDS - 1 {
+                MINT
+            } else {
+                GOLD
+            };
+            Span::styled(format!("{symbol}{spacing}"), Style::new().fg(color))
+        }));
+        lines.push(Line::from(spans));
+    }
+
+    let plot_width = HISTORY_SECONDS * (1 + spacing.len());
+    lines.push(Line::styled(
+        format!(" 0 └{} now", "─".repeat(plot_width - 4)),
+        axis,
+    ));
+    lines
 }
 
 fn append_events(lines: &mut Lines, snapshot: &Snapshot, now: Instant) {
@@ -1322,6 +1451,15 @@ fn value_lines(
     highlight: Option<(usize, Style)>,
 ) -> impl Iterator<Item = Line<'static>> {
     let columns = if binary { 8 } else { bytes.len().max(1) };
+    value_rows(bytes, binary, columns, highlight)
+}
+
+fn value_rows(
+    bytes: &[u8],
+    binary: bool,
+    columns: usize,
+    highlight: Option<(usize, Style)>,
+) -> impl Iterator<Item = Line<'static>> {
     bytes.chunks(columns).enumerate().map(move |(row, chunk)| {
         Line::from_iter(chunk.iter().enumerate().map(|(column, byte)| {
             let style = match highlight {
@@ -1390,42 +1528,26 @@ fn comparison(
         Span::styled("  ·  ", Style::new().fg(DIM)),
         state,
     ]));
-    let target_lines = std::iter::once(label(format!(
-        "Network target · difficulty {}",
-        difficulty_text(target)
-    )))
-    .chain(value_lines(target, binary, highlight));
-    let caption = hash.map_or_else(
-        || "Current hash".into(),
-        |value| {
-            format!(
-                "Current hash · {} leading zero bits",
-                mining::leading_zero_bits(value)
-            )
-        },
-    );
-    let mut hash_lines = std::iter::once(label(caption)).chain(
-        hash.into_iter()
-            .flat_map(|value| value_lines(value, binary, highlight)),
-    );
-
-    let value_width = if binary { 71 } else { 64 };
-    let column_width = value_width + 4;
-    if usize::from(width) >= column_width + value_width {
-        for mut target_line in target_lines {
-            if let Some(hash_line) = hash_lines.next() {
-                let padding = " ".repeat(column_width - target_line.width());
-                target_line.spans.push(Span::raw(padding));
-                target_line.spans.extend(hash_line.spans);
-            }
-            lines.push(target_line);
-        }
-    } else {
+    let split = hash_pair_split(width, binary);
+    let column = split.unwrap_or(width);
+    let mut target_lines = vec![
+        label("Network target"),
+        Line::raw(format!("Difficulty {}", difficulty_text(target))),
+    ];
+    target_lines.extend(hash_lines(target, binary, column, highlight));
+    if hash.is_none() && split.is_none() {
         lines.extend(target_lines);
-        if hash.is_some() {
-            lines.extend(hash_lines);
-        }
+        return;
     }
+    let mut current = vec![label("Current hash")];
+    if let Some(hash) = hash {
+        current.push(Line::raw(format!(
+            "{} leading zero bits",
+            mining::leading_zero_bits(hash)
+        )));
+        current.extend(hash_lines(hash, binary, column, highlight));
+    }
+    append_sections(lines, target_lines, current, width, split);
 }
 
 fn transaction(tx: &Transaction, payout: Option<(&Script, usize)>) -> Lines {
@@ -1509,11 +1631,33 @@ mod tests {
         sample[..2].copy_from_slice(&[0, 0x10]);
         assert_eq!(mining::leading_zero_bits(&sample), 11);
         assert_eq!(mining::leading_zero_bits(&[0; 32]), 256);
+    }
+
+    #[test]
+    fn hash_quality_uses_the_same_scale_when_a_peak_leaves_the_window() {
+        let mut eleven_bits = [u8::MAX; 32];
+        eleven_bits[..2].copy_from_slice(&[0, 0x10]);
         let mut series = [None; HISTORY_SECONDS];
-        series[HISTORY_SECONDS - 1] = Some(sample);
-        let [title, bars] = hash_quality(series);
-        assert!(title.to_string().contains("11 leading zero bits"));
-        assert_eq!(bars.to_string().chars().count(), HISTORY_SECONDS);
+        series[0] = Some([0; 32]);
+        series[HISTORY_SECONDS - 1] = Some(eleven_bits);
+        let with_peak = hash_quality(series, CHART_MIN_WIDTH);
+        series[0] = None;
+        let without_peak = hash_quality(series, CHART_MIN_WIDTH);
+
+        assert!(with_peak[1].to_string().starts_with("64 │↑"));
+        assert!(with_peak.last().unwrap().to_string().starts_with(" 0 └"));
+        assert_eq!(with_peak.last(), without_peak.last());
+        for (before, after) in with_peak[1..].iter().zip(&without_peak[1..]) {
+            assert_eq!(before.spans.last(), after.spans.last());
+        }
+        let bottom = usize::from(CHART_ROWS);
+        assert!(without_peak[bottom - 1].to_string().ends_with('▃'));
+        assert!(without_peak[bottom].to_string().ends_with('█'));
+        assert!(
+            without_peak
+                .iter()
+                .all(|line| line.width() <= usize::from(CHART_MIN_WIDTH))
+        );
     }
 
     #[test]
@@ -1523,22 +1667,40 @@ mod tests {
         for (width, expected_rows) in [(100, 8), (160, 4)] {
             let mut lines = Vec::new();
             comparison(&mut lines, Some(&hash), &target, true, width);
-            assert!(
-                lines[1]
-                    .to_string()
-                    .starts_with("Network target · difficulty 256")
-            );
+            assert!(lines[1].to_string().starts_with("Network target"));
+            assert!(lines[2].to_string().starts_with("Difficulty 256"));
             let rows: Vec<_> = lines
                 .iter()
                 .map(ToString::to_string)
-                .filter(|row| row.starts_with(['0', '1']))
+                .filter(|row| {
+                    row.as_bytes()
+                        .get(..8)
+                        .is_some_and(|prefix| prefix.iter().all(|byte| matches!(byte, b'0' | b'1')))
+                })
                 .collect();
             assert_eq!(rows.len(), expected_rows);
             for row in rows {
-                let bytes: Vec<_> = row.split_whitespace().collect();
+                let bytes: Vec<_> = row.split_whitespace().filter(|part| *part != "│").collect();
                 assert_eq!(bytes.len(), if width >= 146 { 16 } else { 8 });
                 assert!(bytes.iter().all(|byte| byte.len() == 8));
             }
+        }
+    }
+
+    #[test]
+    fn comparison_places_its_divider_on_the_shared_dashboard_column() {
+        let hash = [0x55; 32];
+        let target = [0x33; 32];
+        for (width, binary) in [(74, false), (114, false), (154, true), (194, true)] {
+            let split = mine_column_split(width, binary).unwrap();
+            assert_eq!(hash_pair_split(width, binary), Some(split));
+            let mut lines = Vec::new();
+            comparison(&mut lines, Some(&hash), &target, binary, width);
+            assert!(lines[1].to_string().ends_with("Current hash"));
+            assert!(lines[1..].iter().all(|line| {
+                line.to_string().chars().position(|symbol| symbol == '│')
+                    == Some(usize::from(split + 1))
+            }));
         }
     }
 }
