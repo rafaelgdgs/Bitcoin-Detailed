@@ -14,7 +14,7 @@ The default endpoint is `stratum.ckpool.org:3333` ([Solo CKPool](https://solo.ck
 
 Use **Tab** or **↓** to reach **CPU threads** on the connection screen. The default is one thread. You can enter any count up to the limit shown in the form.
 
-Pressing **Enter** saves the pool endpoint, public address, worker, pool password, and thread count in `bitcoin-detailed.json` next to the executable. The same file holds the best hash, its discovery time in UTC, and the header that produced it. The next launch starts with the form filled in, regardless of the working directory. The file stores the pool password as plain text and is created with owner-only permissions on Unix.
+Pressing **Enter** saves the pool endpoint, public address, worker, pool password, and thread count in `bitcoin-detailed.json` next to the executable. The same file holds the best hash, its discovery time in UTC, and the header that produced it. The TUI displays the discovery time in the system's local time zone. The next launch starts with the form filled in, regardless of the working directory. The file stores the pool password as plain text and is created with owner-only permissions on Unix.
 
 When upgrading, launch once from the directory where you previously ran the miner to import its old best-hash file. The app also looks for that file next to the executable and imports settings from the previous user config location. If you run through Cargo, the executable and the JSON are in `target/debug` or `target/release`; keep a copy of the JSON before running `cargo clean`.
 
@@ -23,10 +23,11 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 | Key | Action |
 | --- | --- |
 | Space | Start or pause automatic mining on the selected device |
-| G | Open the GPU tab and select a device. Enter a listed GPU number or `0` for CPU |
+| G | Open the DEVICE tab and select a device. Enter a listed GPU number or `0` for CPU |
+| I | Change GPU intensity from 1% to 100%. Press Enter to apply and save it |
 | C | Change the CPU thread count without pausing or reconnecting. Press Enter to apply and save it |
 | N | Test a nonce on the displayed job. Enter decimal or hexadecimal, such as `0x1234`. The attempt pauses automatic mining |
-| 1–7, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, Best, and GPU |
+| 1–7, Tab | Switch between Mine, Header, Coinbase, Merkle, Transactions, Best, and DEVICE |
 | B | Toggle hexadecimal and binary. In binary, 32-byte hashes and targets use four rows of eight bytes when the terminal is wide enough |
 | T | Request the job's TXIDs from the pool |
 | ↑ / ↓, PgUp / PgDn | Navigate the TXID list or scroll the tab |
@@ -35,11 +36,15 @@ Mining starts paused. The **Coinbase** tab shows the output that matches your ad
 
 The miner sends every qualifying attempt, manual or automatic, via `mining.submit`. The share target measures work for the pool. The network target, decoded from `nBits`, sets the proof-of-work threshold for a block candidate. Even after the pool accepts a candidate, the network must accept the block for a payout. A CPU or GPU has an extremely small chance of hitting that target.
 
+The **Mine** tab shows the network difficulty derived from the job's `nBits`, alongside the network target and the current hash. On wide terminals the two values appear side by side, with the first differing byte highlighted in each. The **Header** tab also shows the difficulty next to the compact target.
+
 ## GPU mining
 
-On Linux and Windows, the **GPU** tab lists hardware adapters with a Vulkan compute driver. AMD, NVIDIA, and Intel use the same bundled compute shader. Install the Vulkan-capable driver for your card. The TUI handles mining and the pool connection directly. CPU mining remains available when the app finds no compatible GPU.
+On Linux and Windows, the **DEVICE** tab lists hardware adapters with a Vulkan compute driver. AMD, NVIDIA, and Intel use the same bundled compute shader. Install the Vulkan-capable driver for your card. The TUI handles mining and the pool connection directly. CPU mining remains available when the app finds no compatible GPU.
 
 Each session starts with CPU selected. Use **G** to select one GPU. Switching devices keeps the pool connection, current job, and nonce progress. Automatic mining uses one device at a time, and manual nonce tests run on the CPU. The **Mine**, **Header**, and **Best** tabs work with results from either device.
+
+Press **I** to set GPU intensity while mining. At **50%**, the miner waits for about as long as each burst took before submitting more work. Lower values leave more idle time between bursts. The percentage controls the miner's duty cycle. Actual draw, temperature, and hashrate depend on the GPU and its driver. The default is **100%**, and the app remembers your selection in `bitcoin-detailed.json`.
 
 The Vulkan shader reuses the SHA-256 state through the first three rounds of the second 64-byte block. The nonce first enters in round four. Two buffer sets allow the GPU to hash one batch while the CPU reads the previous batch. Each batch covers up to 1,048,576 nonces. The miner uses smaller batches to establish the initial record or handle unusually easy share targets. The shader returns the last hash and a bitmap of nonces eligible for submission or for a new record. The CPU recomputes those hashes and checks the exact targets before updating the display or submitting a share.
 

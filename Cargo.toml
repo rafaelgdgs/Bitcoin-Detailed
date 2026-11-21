@@ -16,6 +16,6 @@ num-bigint = "0.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha2 = { version = "0.10", features = ["compress"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 ureq = "3.4"
 wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "wgsl"] }

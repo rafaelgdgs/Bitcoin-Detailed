@@ -23,6 +23,33 @@ const SHA256_IV: [u32; 8] = [
 ];
 const INITIAL_ROUND_CONSTANTS: [u32; 3] = [0x428a2f98, 0x71374491, 0xb5c0fbcf];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Intensity(u8);
+
+impl Intensity {
+    pub const FULL: Self = Self(100);
+
+    pub fn new(percent: u8) -> Option<Self> {
+        (1..=Self::FULL.0)
+            .contains(&percent)
+            .then_some(Self(percent))
+    }
+
+    pub fn percent(self) -> u8 {
+        self.0
+    }
+
+    pub fn idle_after(self, active: Duration) -> Duration {
+        active * u32::from(Self::FULL.0 - self.0) / u32::from(self.0)
+    }
+}
+
+impl Default for Intensity {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
 const fn output_size(nonces: u64) -> u64 {
     HASH_BYTES + nonces.div_ceil(32) * size_of::<u32>() as u64
 }

@@ -12,18 +12,25 @@ use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use time::UtcOffset;
 
 use crate::engine::{self, Command, Config, Connection, Snapshot};
+use crate::gpu::Intensity;
 use crate::mining::{self, Hash256, Work};
 use crate::storage::{Best, FILE_NAME, SavedState, SetupForm, Storage};
 use crate::workers::{Backend, GpuStatus};
 
-const GOLD: Color = Color::Rgb(255, 189, 91);
-const MINT: Color = Color::Rgb(109, 224, 180);
-const DIM: Color = Color::Rgb(145, 153, 169);
+const BG: Color = Color::Rgb(13, 19, 29);
+const SURFACE: Color = Color::Rgb(21, 29, 42);
+const RAISED: Color = Color::Rgb(29, 40, 56);
+const BORDER: Color = Color::Rgb(66, 83, 105);
+const TEXT: Color = Color::Rgb(224, 232, 243);
+const DIM: Color = Color::Rgb(159, 174, 194);
+const GOLD: Color = Color::Rgb(255, 190, 107);
+const MINT: Color = Color::Rgb(115, 227, 182);
+const RED: Color = Color::Rgb(255, 139, 145);
 const TABS: [&str; 7] = [
     "1 Mine",
     "2 Header",
@@ -31,10 +38,19 @@ const TABS: [&str; 7] = [
     "4 Merkle",
     "5 Transactions",
     "6 Best",
-    "7 GPU",
+    "7 Device",
 ];
 const COMPACT_TABS: [&str; 7] = ["1", "2", "3", "4", "5", "6", "7"];
-const GPU_TAB: usize = 6;
+const SHORT_TABS: [&str; 7] = [
+    "1 Mine",
+    "2 Header",
+    "3 Coinbase",
+    "4 Merkle",
+    "5 TXIDs",
+    "6 Best",
+    "7 Device",
+];
+const DEVICE_TAB: usize = 6;
 
 type Lines = Vec<Line<'static>>;
 
@@ -60,12 +76,16 @@ enum Prompt {
     Nonce(Arc<Work>, String),
     Threads(String),
     Device(String),
+    GpuIntensity(String),
 }
 
 impl Prompt {
     fn input_mut(&mut self) -> &mut String {
         match self {
-            Self::Nonce(_, input) | Self::Threads(input) | Self::Device(input) => input,
+            Self::Nonce(_, input)
+            | Self::Threads(input)
+            | Self::Device(input)
+            | Self::GpuIntensity(input) => input,
         }
     }
 }
@@ -74,6 +94,7 @@ struct App {
     form: SetupForm,
     storage: Storage,
     initial_best: Option<Best>,
+    initial_gpu_intensity: Intensity,
     field: usize,
     connection: Option<Connection>,
     tab: usize,
@@ -100,6 +121,7 @@ impl App {
         Ok(Self {
             form: state.form,
             initial_best: state.best,
+            initial_gpu_intensity: state.gpu_intensity,
             storage,
             field: 1,
             connection: None,
@@ -211,6 +233,13 @@ impl App {
                             .map(|nonce| Command::Manual(work.clone(), nonce))
                             .context("Enter an integer from 0 to 4294967295 or 0x00000000 to 0xffffffff."),
                         Prompt::Threads(input) => engine::parse_thread_count(input).map(Command::SetThreads),
+                        Prompt::GpuIntensity(input) => input
+                            .trim()
+                            .parse()
+                            .ok()
+                            .and_then(Intensity::new)
+                            .map(Command::SetGpuIntensity)
+                            .context("Enter a GPU intensity from 1 to 100."),
                         Prompt::Device(input) => {
                             let count = snapshot
                                 .and_then(|snapshot| snapshot.gpu.adapters.as_deref())
@@ -239,7 +268,9 @@ impl App {
                 KeyCode::Char(c) => {
                     let allowed = match prompt {
                         Prompt::Nonce(..) => c.is_ascii_hexdigit() || matches!(c, 'x' | 'X'),
-                        Prompt::Threads(_) | Prompt::Device(_) => c.is_ascii_digit(),
+                        Prompt::Threads(_) | Prompt::Device(_) | Prompt::GpuIntensity(_) => {
+                            c.is_ascii_digit()
+                        }
                     };
                     let input = prompt.input_mut();
                     if allowed && input.len() < 32 {
@@ -266,18 +297,18 @@ impl App {
                     match Config::new(pool, address, worker, password, threads) {
                         Ok(config) => {
                             self.form[4] = config.threads.to_string();
-                            let best = match self.storage.save_settings(&self.form) {
+                            let (best, intensity) = match self.storage.save_settings(&self.form) {
                                 Ok(state) => {
                                     self.notice.clear();
-                                    state.best
+                                    (state.best, state.gpu_intensity)
                                 }
                                 Err(error) => {
                                     self.notice = format!("Could not save {FILE_NAME}: {error:#}");
-                                    self.initial_best.take()
+                                    (self.initial_best.take(), self.initial_gpu_intensity)
                                 }
                             };
                             self.connection =
-                                Some(engine::start(config, self.storage.clone(), best));
+                                Some(engine::start(config, self.storage.clone(), best, intensity));
                         }
                         Err(error) => self.notice = format!("{error}"),
                     }
@@ -314,9 +345,14 @@ impl App {
                 self.prompt = Some(Prompt::Threads(String::new()));
             }
             KeyCode::Char('g' | 'G') => {
-                self.select_tab(GPU_TAB);
+                self.select_tab(DEVICE_TAB);
                 self.notice.clear();
                 self.prompt = Some(Prompt::Device(String::new()));
+            }
+            KeyCode::Char('i' | 'I') => {
+                self.select_tab(DEVICE_TAB);
+                self.notice.clear();
+                self.prompt = Some(Prompt::GpuIntensity(String::new()));
             }
             KeyCode::Char('t') => {
                 if let Some(work) = &snapshot.work {
@@ -385,7 +421,12 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame, snapshot: Option<&Snapshot>) {
-        let area = frame.area();
+        let screen = frame.area();
+        frame.render_widget(Block::new().style(Style::new().fg(TEXT).bg(BG)), screen);
+        let area = screen.inner(ratatui::layout::Margin::new(
+            u16::from(screen.width >= 76),
+            0,
+        ));
         if area.width < 36 || area.height < 13 {
             frame.render_widget(
                 Paragraph::new("Enlarge the terminal (minimum 36 × 13)."),
@@ -399,57 +440,78 @@ impl App {
         };
         let [title, state, tabs, body, footer] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(if area.height >= 19 { 2 } else { 1 }),
             Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(2),
+            Constraint::Min(3),
             Constraint::Length(3),
         ])
         .areas(area);
         frame.render_widget(
             Line::from(vec![
-                Span::styled(
-                    " BITCOIN DETAILED ",
-                    Style::new().fg(Color::Black).bg(GOLD).bold(),
-                ),
-                Span::styled("  Bitcoin mainnet / Stratum V1 TCP", Style::new().fg(DIM)),
-            ]),
+                Span::styled(" ₿ ", Style::new().fg(BG).bg(GOLD).bold()),
+                Span::styled(" BITCOIN DETAILED", Style::new().fg(TEXT).bold()),
+                Span::styled("  ·  Mainnet", Style::new().fg(DIM)),
+            ])
+            .style(Style::new().bg(RAISED)),
             title,
         );
+        let status_color = match &snapshot.work {
+            Some(work) if work.paid_sats > 0 => MINT,
+            Some(_) => GOLD,
+            None if snapshot.status.starts_with("Disconnected") => RED,
+            None => DIM,
+        };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled(format!(" {}", snapshot.status), Style::new().fg(MINT)),
-                Line::styled(format!(" {}", self.form[0]), Style::new().fg(DIM)),
-            ]),
+                Line::from(vec![
+                    Span::styled(" ● ", Style::new().fg(status_color)),
+                    Span::styled(snapshot.status.as_str(), Style::new().fg(status_color)),
+                ]),
+                Line::styled(
+                    format!("   Stratum V1 · {}", self.form[0]),
+                    Style::new().fg(DIM),
+                ),
+            ])
+            .style(Style::new().bg(SURFACE)),
             state,
         );
-        let tab_width =
-            TABS.iter().map(|title| title.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
-        let titles = if usize::from(tabs.width) >= tab_width {
-            TABS
-        } else {
-            COMPACT_TABS
-        };
+        let titles = [TABS, SHORT_TABS, COMPACT_TABS]
+            .into_iter()
+            .find(|labels| {
+                labels.iter().map(|label| label.len() + 2).sum::<usize>() + labels.len() - 1
+                    <= usize::from(tabs.width)
+            })
+            .unwrap_or(COMPACT_TABS);
+        let [nav, _] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(tabs);
         frame.render_widget(
             Tabs::new(titles)
                 .select(self.tab)
-                .highlight_style(Style::new().fg(GOLD).bold())
+                .highlight_style(Style::new().fg(BG).bg(GOLD).bold())
                 .style(Style::new().fg(DIM))
-                .divider(" │ "),
-            tabs,
+                .divider(" "),
+            nav,
         );
-        let border = Block::bordered()
+        let border = panel()
             .title(format!(" {} ", TABS[self.tab].split_once(' ').unwrap().1))
-            .border_style(Style::new().fg(DIM));
-        let inner = border.inner(body);
+            .title_style(Style::new().fg(TEXT).bold())
+            .padding(Padding::horizontal(u16::from(body.width >= 76)));
+        let mut inner = border.inner(body);
         frame.render_widget(border, body);
+        let show_metrics = self.tab == 0 && inner.width >= 80 && inner.height >= 13;
+        if show_metrics {
+            let [metrics, content] =
+                Layout::vertical([Constraint::Length(5), Constraint::Fill(1)]).areas(inner);
+            draw_metrics(frame, metrics, snapshot);
+            inner = content;
+        }
         let content = match self.tab {
-            0 => self.dashboard(snapshot),
+            0 => self.dashboard(snapshot, inner.width, show_metrics),
             1 => self.header(snapshot),
             2 => self.coinbase(snapshot),
             3 => self.merkle(snapshot),
             4 => self.transactions(snapshot, inner.height),
             5 => self.best(snapshot),
-            GPU_TAB => self.gpu(snapshot),
+            DEVICE_TAB => self.device(snapshot),
             _ => unreachable!(),
         };
         let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
@@ -470,8 +532,18 @@ impl App {
             Some(Prompt::Device(input)) => {
                 format!(" Device number (0 = CPU)  › {input}▌  [Enter select · Esc cancel]")
             }
+            Some(Prompt::GpuIntensity(input)) => format!(
+                " GPU intensity (1–100%, current {}%)  › {input}▌  [Enter apply · Esc cancel]",
+                snapshot.gpu.intensity.percent()
+            ),
+            None if area.width < 75 => match self.tab {
+                0 => " Space mine/pause · N nonce · B hex/bin · Tab tabs · Q quit",
+                4 => " T TXIDs · ↑↓ scroll · Tab tabs · Q quit",
+                DEVICE_TAB => " G device · I intensity · Space mine/pause · Tab tabs · Q quit",
+                _ => " ↑↓ scroll · B hex/bin · Tab tabs · Q quit",
+            }.into(),
             None => {
-                " 1–7/Tab tabs · Space mine/pause · G device · C threads · N nonce · B hex/bin · T TXIDs · Q quit".into()
+                " Space mine/pause · 1–7/Tab switch · N nonce · B hex/bin · G device · I intensity · C threads · T TXIDs · Q quit".into()
             }
         };
         let message = if self.notice.is_empty() {
@@ -481,8 +553,11 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled(prompt, Style::new().fg(GOLD)),
-                Line::raw(format!(" {message}")),
+                Line::styled(prompt, Style::new().fg(GOLD).bg(RAISED)),
+                Line::styled(
+                    format!(" {message}"),
+                    Style::new().fg(if self.notice.is_empty() { DIM } else { GOLD }),
+                ),
             ])
             .wrap(Wrap { trim: false }),
             footer,
@@ -490,9 +565,15 @@ impl App {
     }
 
     fn draw_form(&self, frame: &mut Frame, area: Rect) {
+        let centered = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(area.width.min(96)),
+            Constraint::Fill(1),
+        ])
+        .areas::<3>(area)[1];
         let mut lines = vec![
-            label("Bitcoin Detailed"),
-            Line::raw("Solo CPU and Vulkan GPU mining with live Bitcoin mainnet jobs."),
+            Line::styled("Solo Bitcoin mining · Stratum V1", Style::new().fg(DIM)),
+            Line::default(),
         ];
         let thread_label = format!("CPU threads (1–{})", engine::max_threads());
         for (i, name) in [
@@ -510,53 +591,71 @@ impl App {
             } else {
                 self.form[i].clone()
             };
-            lines.push(Line::styled(
-                format!(
-                    "{} {name}  › {value}{}",
-                    if self.field == i { "▸" } else { " " },
-                    if self.field == i { "▌" } else { "" }
+            let active = self.field == i;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} {name}  › ", if active { "▸" } else { " " }),
+                    Style::new().fg(if active { GOLD } else { DIM }),
                 ),
-                Style::new().fg(if self.field == i { GOLD } else { Color::Reset }),
-            ));
+                Span::styled(
+                    format!("{value}{}", if active { "▌" } else { "" }),
+                    if active {
+                        Style::new().fg(TEXT).bg(RAISED).bold()
+                    } else {
+                        Style::new().fg(TEXT)
+                    },
+                ),
+            ]));
         }
-        lines.push(Line::raw("Tab/↑↓ select field · Enter connect · Esc quit"));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Tab/↑↓ select field · Enter connect · Esc quit",
+            Style::new().fg(GOLD),
+        ));
         if !self.notice.is_empty() {
-            lines.push(Line::styled(
-                self.notice.clone(),
-                Style::new().fg(Color::LightRed),
-            ));
+            lines.push(Line::styled(self.notice.clone(), Style::new().fg(RED)));
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::bordered())
+                .block(
+                    panel()
+                        .title(label(" ₿  BITCOIN DETAILED "))
+                        .padding(Padding::horizontal(1)),
+                )
                 .wrap(Wrap { trim: false }),
-            area,
+            centered,
         );
     }
 
-    fn dashboard(&self, snapshot: &Snapshot) -> Lines {
+    fn dashboard(&self, snapshot: &Snapshot, width: u16, show_metrics: bool) -> Lines {
         let backend = match snapshot.backend {
             Backend::Cpu => format!("Threads: {}", snapshot.threads),
             Backend::Vulkan(index) => snapshot.gpu.adapters.as_ref().unwrap()[index].clone(),
         };
-        let mut lines = vec![
-            label(format!(
-                "{} · {backend}",
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
                 match (snapshot.running, snapshot.backend) {
-                    (true, Backend::Cpu) => "MINING ON CPU",
-                    (true, Backend::Vulkan(_)) => "MINING ON GPU",
-                    (false, _) => "MINING PAUSED",
+                    (true, Backend::Cpu) => " MINING ON CPU ",
+                    (true, Backend::Vulkan(_)) => " MINING ON GPU ",
+                    (false, _) => " MINING PAUSED ",
                 },
-            )),
-            Line::raw(format!(
-                "{} H/s · {} attempts · {} shares accepted / {} rejected · {} block candidates",
-                snapshot.rate,
-                snapshot.total,
+                Style::new()
+                    .fg(BG)
+                    .bg(if snapshot.running { MINT } else { GOLD })
+                    .bold(),
+            ),
+            Span::raw(format!("  {backend}")),
+        ])];
+        if !show_metrics {
+            lines.push(Line::raw(format!(
+                "{} · {} attempts · {} shares accepted / {} rejected · {} block candidates",
+                hashrate_text(snapshot.rate),
+                grouped_digits(&snapshot.total.to_string()),
                 snapshot.accepted,
                 snapshot.rejected,
                 snapshot.network_hits
-            )),
-        ];
+            )));
+        }
         if let Some(candidate) = &snapshot.candidate {
             lines.push(Line::styled(candidate.clone(), Style::new().fg(MINT)));
         }
@@ -568,43 +667,46 @@ impl App {
             return lines;
         };
         lines.push(Line::raw(format!(
-            "Job {} · {} sat to your address",
-            work.job.id, work.paid_sats
+            "Job {} · {} sat to your address · {}",
+            work.job.id,
+            grouped_digits(&work.paid_sats.to_string()),
+            if self.binary { "Binary" } else { "Hex" }
         )));
         lines.push(Line::default());
-        lines.push(label(
-            "Proof of work · the hash must be at or below the target",
-        ));
         let last = snapshot.last.as_ref().map(|attempt| &attempt.hash);
-        comparison(&mut lines, last, &work.job.network_target, self.binary);
+        comparison(
+            &mut lines,
+            last,
+            &work.job.network_target,
+            self.binary,
+            width,
+        );
+        if let Some(last) = snapshot.last {
+            lines.push(Line::styled(
+                format!("Current nonce: {} · 0x{:08x}", last.nonce(), last.nonce()),
+                Style::new().fg(DIM),
+            ));
+        }
+        lines.push(Line::default());
         if let Some(target) = &work.job.share_target {
             lines.push(label(format!(
                 "Share target · difficulty {}",
                 work.job.share_difficulty.as_deref().unwrap_or("—")
             )));
             lines.extend(value_lines(target, self.binary, None));
-            lines.push(Line::raw(
-                "Shares measure work for the pool. A solo block reward requires meeting the network target.",
-            ));
         } else {
             lines.push(Line::raw(
                 "The pool has not set a share difficulty for this job.",
             ));
         }
         if let Some(best) = &snapshot.best {
+            lines.push(Line::default());
             self.append_best_hash(&mut lines, best);
-        }
-        if let Some(last) = snapshot.last {
-            lines.push(Line::raw(format!(
-                "Current nonce: {} · 0x{:08x}",
-                last.nonce(),
-                last.nonce()
-            )));
         }
         lines
     }
 
-    fn gpu(&self, snapshot: &Snapshot) -> Lines {
+    fn device(&self, snapshot: &Snapshot) -> Lines {
         let device_line = |text, backend| {
             Line::styled(
                 text,
@@ -639,6 +741,10 @@ impl App {
         lines.push(Line::raw(
             "Press G and enter a device number. Space starts or pauses mining.",
         ));
+        lines.push(Line::raw(format!(
+            "GPU intensity: {}% · Press I to change",
+            snapshot.gpu.intensity.percent()
+        )));
         match &snapshot.gpu.status {
             GpuStatus::Idle => {}
             GpuStatus::Preparing => {
@@ -657,7 +763,7 @@ impl App {
             }
             GpuStatus::Failed(error) => lines.push(Line::styled(
                 format!("Vulkan error: {error}"),
-                Style::new().fg(Color::LightRed),
+                Style::new().fg(RED),
             )),
         }
         if matches!(snapshot.backend, Backend::Vulkan(_))
@@ -716,7 +822,11 @@ impl App {
                 72,
                 76,
                 "nBits",
-                format!("0x{:08x} · network target in compact form", work.job.bits),
+                format!(
+                    "0x{:08x} · compact network target · difficulty {}",
+                    work.job.bits,
+                    difficulty_text(&work.job.network_target)
+                ),
             ),
             (
                 76,
@@ -904,11 +1014,21 @@ impl App {
         )));
         lines.push(Line::raw(match best.recorded_at {
             Some(timestamp) => {
-                let utc = timestamp.to_offset(UtcOffset::UTC);
-                let (hour, minute, second) = utc.to_hms();
+                let local = UtcOffset::local_offset_at(timestamp)
+                    .ok()
+                    .and_then(|offset| timestamp.checked_to_offset(offset))
+                    .unwrap_or(timestamp);
+                let (hour, minute, second) = local.to_hms();
+                let offset = local.offset();
+                let suffix = if offset.is_utc() {
+                    String::new()
+                } else {
+                    let offset = offset.to_string();
+                    offset.strip_suffix(":00").unwrap_or(&offset).to_owned()
+                };
                 format!(
-                    "Recorded at: {} {hour:02}:{minute:02}:{second:02} UTC",
-                    utc.date()
+                    "Recorded at: {} {hour:02}:{minute:02}:{second:02} UTC{suffix}",
+                    local.date()
                 )
             }
             None => "Recorded at: unknown (older record)".into(),
@@ -951,6 +1071,81 @@ fn waiting() -> Lines {
     vec![Line::raw("Waiting for a job from the pool.")]
 }
 
+fn panel() -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .style(Style::new().fg(TEXT).bg(SURFACE))
+}
+
+fn draw_metrics(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
+    let areas = Layout::horizontal([Constraint::Fill(1); 4])
+        .spacing(1)
+        .areas::<4>(area);
+    for (area, name, values) in [
+        (
+            areas[0],
+            "Hashrate",
+            vec![
+                Line::styled(hashrate_text(snapshot.rate), Style::new().fg(GOLD).bold()),
+                if snapshot.rate >= 1_000 {
+                    Line::styled(
+                        format!("{} H/s", grouped_digits(&snapshot.rate.to_string())),
+                        Style::new().fg(DIM),
+                    )
+                } else {
+                    Line::default()
+                },
+            ],
+        ),
+        (
+            areas[1],
+            "Attempts",
+            vec![Line::styled(
+                grouped_digits(&snapshot.total.to_string()),
+                Style::new().bold(),
+            )],
+        ),
+        (
+            areas[2],
+            "Shares",
+            vec![
+                Line::styled(
+                    format!(
+                        "{} accepted",
+                        grouped_digits(&snapshot.accepted.to_string())
+                    ),
+                    Style::new().fg(MINT).bold(),
+                ),
+                Line::styled(
+                    format!(
+                        "{} rejected",
+                        grouped_digits(&snapshot.rejected.to_string())
+                    ),
+                    Style::new().fg(if snapshot.rejected == 0 { DIM } else { RED }),
+                ),
+            ],
+        ),
+        (
+            areas[3],
+            "Block candidates",
+            vec![Line::styled(
+                grouped_digits(&snapshot.network_hits.to_string()),
+                Style::new().bold(),
+            )],
+        ),
+    ] {
+        let card = panel()
+            .style(Style::new().bg(RAISED))
+            .padding(Padding::horizontal(1))
+            .title(Line::styled(format!(" {name} "), Style::new().fg(DIM)));
+        frame.render_widget(
+            Paragraph::new(values).block(card),
+            Rect { height: 4, ..area },
+        );
+    }
+}
+
 fn label(text: impl Into<String>) -> Line<'static> {
     Line::styled(
         text.into(),
@@ -962,11 +1157,45 @@ fn difficulty_text(hash: &Hash256) -> String {
     let difficulty = mining::hash_difficulty(hash);
     if difficulty.is_infinite() {
         "∞".into()
-    } else if (0.0001..1_000_000.0).contains(&difficulty) {
-        format!("{difficulty:.6}")
+    } else if (0.0001..1e16).contains(&difficulty) {
+        let precision = if difficulty >= 1_000_000.0 { 2 } else { 6 };
+        let fixed = format!("{difficulty:.precision$}");
+        let (whole, fraction) = fixed.split_once('.').unwrap();
+        let mut text = grouped_digits(whole);
+        let fraction = fraction.trim_end_matches('0');
+        if !fraction.is_empty() {
+            text.push('.');
+            text.push_str(fraction);
+        }
+        text
     } else {
         format!("{difficulty:.4e}")
     }
+}
+
+fn grouped_digits(digits: &str) -> String {
+    let mut text = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.bytes().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            text.push(',');
+        }
+        text.push(char::from(digit));
+    }
+    text
+}
+
+fn hashrate_text(rate: u64) -> String {
+    for (unit, divisor) in [
+        ("TH/s", 1_000_000_000_000),
+        ("GH/s", 1_000_000_000),
+        ("MH/s", 1_000_000),
+        ("kH/s", 1_000),
+    ] {
+        if rate >= divisor {
+            return format!("{:.2} {unit}", rate as f64 / divisor as f64);
+        }
+    }
+    format!("{rate} H/s")
 }
 
 fn value_lines(
@@ -1002,31 +1231,73 @@ fn bytes(lines: &mut Lines, bytes: &[u8], offset: usize) {
     }
 }
 
-fn comparison(lines: &mut Lines, hash: Option<&[u8; 32]>, target: &[u8; 32], binary: bool) {
-    if let Some(hash) = hash {
-        let color = if hash <= target {
-            MINT
-        } else {
-            Color::LightRed
-        };
-        lines.push(Line::styled(
-            if hash <= target {
-                "Hash ≤ network target"
-            } else {
-                "Hash > network target"
-            },
-            Style::new().fg(color),
-        ));
-        let difference = hash.iter().zip(target).position(|(a, b)| a != b);
-        let highlight = difference.map(|index| (index, Style::new().fg(color).bold()));
-        for (caption, value) in [("Current hash", hash), ("Network target", target)] {
-            lines.push(Line::raw(caption));
-            lines.extend(value_lines(value, binary, highlight));
+fn comparison(
+    lines: &mut Lines,
+    hash: Option<&Hash256>,
+    target: &Hash256,
+    binary: bool,
+    width: u16,
+) {
+    let mut highlight = None;
+    let state = match hash {
+        Some(hash) => {
+            let meets_target = hash <= target;
+            let color = if meets_target { MINT } else { DIM };
+            highlight = hash
+                .iter()
+                .zip(target)
+                .position(|(a, b)| a != b)
+                .map(|index| {
+                    (
+                        index,
+                        Style::new()
+                            .fg(if meets_target { MINT } else { GOLD })
+                            .bold()
+                            .underlined(),
+                    )
+                });
+            Span::styled(
+                if meets_target {
+                    "Hash ≤ network target"
+                } else {
+                    "Hash > network target"
+                },
+                Style::new().fg(color),
+            )
+        }
+        None => Span::styled("Waiting for an attempt", Style::new().fg(DIM)),
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Proof of work", Style::new().fg(TEXT).bold()),
+        Span::styled("  ·  ", Style::new().fg(DIM)),
+        state,
+    ]));
+    let target_lines = std::iter::once(label(format!(
+        "Network target · difficulty {}",
+        difficulty_text(target)
+    )))
+    .chain(value_lines(target, binary, highlight));
+    let mut hash_lines = std::iter::once(label("Current hash")).chain(
+        hash.into_iter()
+            .flat_map(|value| value_lines(value, binary, highlight)),
+    );
+
+    let value_width = if binary { 71 } else { 64 };
+    let column_width = value_width + 4;
+    if usize::from(width) >= column_width + value_width {
+        for mut target_line in target_lines {
+            if let Some(hash_line) = hash_lines.next() {
+                let padding = " ".repeat(column_width - target_line.width());
+                target_line.spans.push(Span::raw(padding));
+                target_line.spans.extend(hash_line.spans);
+            }
+            lines.push(target_line);
         }
     } else {
-        lines.push(Line::raw("Current hash: waiting for an attempt"));
-        lines.push(Line::raw("Network target"));
-        lines.extend(value_lines(target, binary, None));
+        lines.extend(target_lines);
+        if hash.is_some() {
+            lines.extend(hash_lines);
+        }
     }
 }
 
@@ -1094,4 +1365,36 @@ fn transaction(tx: &Transaction, payout: Option<(&Script, usize)>) -> Lines {
         offset += encoded_len;
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{CompactTarget, Target};
+
+    #[test]
+    fn network_difficulty_and_binary_rows_fit_both_comparison_layouts() {
+        let target = Target::from_compact(CompactTarget::from_consensus(0x1c00ffff)).to_be_bytes();
+        let hash = [0x55; 32];
+        for (width, expected_rows) in [(100, 8), (160, 4)] {
+            let mut lines = Vec::new();
+            comparison(&mut lines, Some(&hash), &target, true, width);
+            assert!(
+                lines[1]
+                    .to_string()
+                    .starts_with("Network target · difficulty 256")
+            );
+            let rows: Vec<_> = lines
+                .iter()
+                .map(ToString::to_string)
+                .filter(|row| row.starts_with(['0', '1']))
+                .collect();
+            assert_eq!(rows.len(), expected_rows);
+            for row in rows {
+                let bytes: Vec<_> = row.split_whitespace().collect();
+                assert_eq!(bytes.len(), if width >= 146 { 16 } else { 8 });
+                assert!(bytes.iter().all(|byte| byte.len() == 8));
+            }
+        }
+    }
 }

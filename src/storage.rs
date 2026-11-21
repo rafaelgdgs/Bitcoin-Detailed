@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::gpu::Intensity;
 use crate::mining::{self, Hash256};
 
 pub const FILE_NAME: &str = "bitcoin-detailed.json";
@@ -63,6 +64,7 @@ impl Best {
 pub struct SavedState {
     pub form: SetupForm,
     pub best: Option<Best>,
+    pub gpu_intensity: Intensity,
 }
 
 impl Default for SavedState {
@@ -76,6 +78,7 @@ impl Default for SavedState {
                 "1".into(),
             ],
             best: None,
+            gpu_intensity: Intensity::default(),
         }
     }
 }
@@ -122,6 +125,11 @@ impl Storage {
                 .context("Saved state must be a JSON object")?;
             if let Some(settings) = document.get("settings") {
                 state.form = read_form(settings, state.form)?;
+                state.gpu_intensity = settings["gpu_intensity"]
+                    .as_u64()
+                    .and_then(|percent| u8::try_from(percent).ok())
+                    .and_then(Intensity::new)
+                    .unwrap_or_default();
             }
             if let Some(best) = document.get("best").filter(|value| !value.is_null()) {
                 state.best = Some(Best::from_json(best)?);
@@ -149,6 +157,11 @@ impl Storage {
 
     pub fn save_threads(&self, count: usize) -> Result<()> {
         self.update(|state| state.form[4] = count.to_string())?;
+        Ok(())
+    }
+
+    pub fn save_gpu_intensity(&self, intensity: Intensity) -> Result<()> {
+        self.update(|state| state.gpu_intensity = intensity)?;
         Ok(())
     }
 
@@ -182,6 +195,7 @@ impl Storage {
                 "worker": worker,
                 "password": password,
                 "threads": threads.trim().parse::<u64>().context("Invalid saved thread count")?,
+                "gpu_intensity": state.gpu_intensity.percent(),
             },
             "best": state.best.as_ref().map(Best::to_json).transpose()?,
         });
@@ -291,7 +305,9 @@ mod tests {
             old_json.as_object_mut().unwrap().remove("recorded_at");
             fs::write(&legacy_best, serde_json::to_vec(&old_json)?)?;
 
-            let mut form = storage.load()?.form;
+            let initial = storage.load()?;
+            assert_eq!(initial.gpu_intensity.percent(), 100);
+            let mut form = initial.form;
             assert_eq!(form[0], "127.0.0.1:3333");
             assert_eq!(form[2], "old-worker");
             assert_eq!(form[4], "1");
@@ -306,8 +322,11 @@ mod tests {
             form[4] = "6".into();
             std::thread::scope(|scope| -> Result<()> {
                 let settings_write = scope.spawn(|| storage.save_settings(&form));
+                let gpu_write =
+                    scope.spawn(|| storage.save_gpu_intensity(Intensity::new(37).unwrap()));
                 storage.save_best(&better)?;
                 settings_write.join().unwrap()?;
+                gpu_write.join().unwrap()?;
                 Ok(())
             })?;
             storage.save_best(&older)?;
@@ -320,6 +339,7 @@ mod tests {
         let (form, saved, better) = result?;
         let best = saved.best.context("Best hash was not saved")?;
         assert_eq!(saved.form, form);
+        assert_eq!(saved.gpu_intensity.percent(), 37);
         assert_eq!(best.hash, better.hash);
         assert_eq!(best.recorded_at, better.recorded_at);
         Ok(())

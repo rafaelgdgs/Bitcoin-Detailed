@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -13,6 +13,7 @@ use crate::mining::{Attempt, Hash256, Work};
 pub const NONCE_SPACE: u64 = u32::MAX as u64 + 1;
 const CPU_BATCH_SIZE: u64 = 16_384;
 const MAX_PENDING_SOLUTIONS: usize = 4_096;
+const GPU_BURST_TIME: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Backend {
@@ -25,6 +26,7 @@ pub enum Backend {
 pub struct GpuInfo {
     pub adapters: Option<Arc<[String]>>,
     pub status: GpuStatus,
+    pub intensity: gpu::Intensity,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -105,12 +107,13 @@ pub struct Workers {
 }
 
 impl Workers {
-    pub fn new(count: usize) -> Result<Self> {
+    pub fn new(count: usize, intensity: gpu::Intensity) -> Result<Self> {
         let mut pool = Self {
             shared: Arc::new(Shared::default()),
             threads: Vec::new(),
             gpu_thread: None,
         };
+        pool.set_gpu_intensity(intensity);
         pool.resize(count)?;
         let shared = pool.shared.clone();
         match thread::Builder::new()
@@ -144,6 +147,11 @@ impl Workers {
 
     pub fn gpu_info(&self) -> GpuInfo {
         self.shared.scheduler.lock().unwrap().gpu.clone()
+    }
+
+    pub fn set_gpu_intensity(&self, intensity: gpu::Intensity) {
+        self.shared.scheduler.lock().unwrap().gpu.intensity = intensity;
+        self.shared.changed.notify_all();
     }
 
     pub fn select_backend(&self, backend: Backend) {
@@ -234,6 +242,47 @@ fn run_cpu_worker(shared: Arc<Shared>, index: usize) {
     }
 }
 
+#[derive(Default)]
+struct GpuPacing {
+    intensity: gpu::Intensity,
+    burst_started: Option<Instant>,
+    idle_until: Option<Instant>,
+}
+
+impl GpuPacing {
+    fn set_intensity(&mut self, intensity: gpu::Intensity, has_work_in_flight: bool) {
+        if self.intensity != intensity {
+            self.intensity = intensity;
+            self.idle_until = None;
+            self.burst_started =
+                (intensity != gpu::Intensity::FULL && has_work_in_flight).then(Instant::now);
+        }
+    }
+
+    fn can_submit(&self, now: Instant) -> bool {
+        self.burst_started
+            .is_none_or(|started| now - started < GPU_BURST_TIME)
+    }
+
+    fn begin_submission(&mut self) {
+        if self.intensity != gpu::Intensity::FULL {
+            self.burst_started.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn finish_burst(&mut self, finished: Instant) {
+        if let Some(started) = self.burst_started.take() {
+            self.idle_until = Some(finished + self.intensity.idle_after(finished - started));
+        }
+    }
+
+    fn idle_remaining(&self) -> Duration {
+        self.idle_until.map_or(Duration::ZERO, |until| {
+            until.saturating_duration_since(Instant::now())
+        })
+    }
+}
+
 fn run_gpu_worker(shared: Arc<Shared>) {
     let adapters = gpu::adapters();
     let mut state = shared.scheduler.lock().unwrap();
@@ -246,6 +295,7 @@ fn run_gpu_worker(shared: Arc<Shared>) {
     let mut miner = None;
     let mut dispatched = VecDeque::<gpu::Dispatch>::with_capacity(gpu::SLOT_COUNT);
     let mut next_slot = 0;
+    let mut pacing = GpuPacing::default();
     while !state.stopping {
         let Backend::Vulkan(index) = state.backend else {
             state = shared.changed.wait(state).unwrap();
@@ -275,12 +325,19 @@ fn run_gpu_worker(shared: Arc<Shared>) {
         }
 
         let (_, device) = miner.as_mut().expect("A ready GPU has a compute device");
-        let (unconfirmed_start, result) = if dispatched.len() < gpu::SLOT_COUNT && state.can_scan()
+        pacing.set_intensity(state.gpu.intensity, !dispatched.is_empty());
+        let idle = pacing.idle_remaining();
+        let can_scan = state.can_scan();
+        let (unconfirmed_start, result) = if can_scan
+            && idle.is_zero()
+            && dispatched.len() < gpu::SLOT_COUNT
+            && pacing.can_submit(Instant::now())
         {
             let work = state.work.as_deref().expect("Running workers have a job");
             let size = gpu::batch_size(work, state.best_limit);
             let (work, range, best_limit) = state.reserve(size);
             drop(state);
+            pacing.begin_submission();
             let start = dispatched.front().map_or(range.start, gpu::Dispatch::start);
             let result = device
                 .submit(next_slot, work, range, best_limit)
@@ -294,7 +351,11 @@ fn run_gpu_worker(shared: Arc<Shared>) {
             drop(state);
             (dispatch.start(), device.collect(dispatch).map(Some))
         } else {
-            state = shared.changed.wait(state).unwrap();
+            state = if can_scan && !idle.is_zero() {
+                shared.changed.wait_timeout(state, idle).unwrap().0
+            } else {
+                shared.changed.wait(state).unwrap()
+            };
             continue;
         };
         state = shared.scheduler.lock().unwrap();
@@ -303,6 +364,9 @@ fn run_gpu_worker(shared: Arc<Shared>) {
             Ok(Some(batch)) => {
                 state.finish(batch);
                 state.in_flight -= 1;
+                if dispatched.is_empty() {
+                    pacing.finish_burst(Instant::now());
+                }
             }
             Err(error) => {
                 // Results are collected in nonce order, so only the unconfirmed suffix is retried.
@@ -314,6 +378,7 @@ fn run_gpu_worker(shared: Arc<Shared>) {
                 drop(state);
                 dispatched.clear();
                 next_slot = 0;
+                pacing = GpuPacing::default();
                 miner = None;
                 state = shared.scheduler.lock().unwrap();
             }
@@ -394,6 +459,29 @@ mod tests {
     use crate::mining::Job;
 
     #[test]
+    fn gpu_pacing_limits_bursts_and_cancels_idle_when_intensity_changes() {
+        let mut pacing = GpuPacing::default();
+        let quarter = gpu::Intensity::new(25).unwrap();
+        pacing.set_intensity(quarter, false);
+        pacing.begin_submission();
+        let started = pacing.burst_started.unwrap();
+        let active = GPU_BURST_TIME;
+        assert!(pacing.can_submit(started + active / 2));
+        assert!(!pacing.can_submit(started + active));
+        pacing.finish_burst(started + active);
+        assert!(pacing.can_submit(started + active));
+        assert_eq!(pacing.idle_until, Some(started + active * 4));
+
+        pacing.set_intensity(gpu::Intensity::FULL, false);
+        assert!(pacing.idle_remaining().is_zero());
+        pacing.begin_submission();
+        assert!(pacing.burst_started.is_none());
+
+        pacing.set_intensity(quarter, true);
+        assert!(pacing.burst_started.is_some());
+    }
+
+    #[test]
     fn independent_workers_preserve_nonce_coverage_across_pause_and_resize() -> Result<()> {
         let block = genesis_block(Network::Bitcoin);
         let coinbase = &block.txdata[0];
@@ -418,7 +506,7 @@ mod tests {
             vec![],
             &coinbase.output[0].script_pubkey,
         )?);
-        let mut workers = Workers::new(1)?;
+        let mut workers = Workers::new(1, gpu::Intensity::FULL)?;
         let start = NONCE_SPACE - 6 * CPU_BATCH_SIZE - 3;
         workers.install(work.clone(), None);
         workers.shared.scheduler.lock().unwrap().next_nonce = start;

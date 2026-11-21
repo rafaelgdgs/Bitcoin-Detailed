@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
+use crate::gpu::Intensity;
 use crate::mining::{self, Attempt, Hash256, Job, Work};
 use crate::storage::{Best, Storage};
 use crate::stratum::Stratum;
@@ -90,6 +91,7 @@ impl Config {
 pub enum Command {
     Toggle,
     SetThreads(usize),
+    SetGpuIntensity(Intensity),
     SelectBackend(Backend),
     Manual(Arc<Work>, u32),
     Txids(Arc<Work>),
@@ -118,7 +120,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(best: Option<Best>, threads: usize) -> Self {
+    fn new(best: Option<Best>, threads: usize, gpu_intensity: Intensity) -> Self {
         Self {
             status: "Connecting…".into(),
             message: "Space starts or pauses automatic mining. N tests a nonce.".into(),
@@ -130,7 +132,10 @@ impl Snapshot {
             running: false,
             threads,
             backend: Backend::Cpu,
-            gpu: GpuInfo::default(),
+            gpu: GpuInfo {
+                intensity: gpu_intensity,
+                ..GpuInfo::default()
+            },
             accepted: 0,
             rejected: 0,
             network_hits: 0,
@@ -154,9 +159,14 @@ impl Connection {
     }
 }
 
-pub fn start(config: Config, storage: Storage, best: Option<Best>) -> Connection {
+pub fn start(
+    config: Config,
+    storage: Storage,
+    best: Option<Best>,
+    gpu_intensity: Intensity,
+) -> Connection {
     let (sender, commands) = mpsc::channel();
-    let snapshot = Snapshot::new(best, config.threads);
+    let snapshot = Snapshot::new(best, config.threads, gpu_intensity);
     let shared = Arc::new(Mutex::new(snapshot.clone()));
     let published = Arc::clone(&shared);
     let thread = std::thread::spawn(move || {
@@ -228,6 +238,17 @@ impl Engine {
         self.publish();
     }
 
+    fn set_gpu_intensity(&mut self, intensity: Intensity, workers: &Workers) {
+        workers.set_gpu_intensity(intensity);
+        self.snapshot.gpu = workers.gpu_info();
+        let message = format!("GPU intensity set to {}%.", intensity.percent());
+        self.snapshot.message = match self.storage.save_gpu_intensity(intensity) {
+            Ok(()) => message,
+            Err(error) => format!("{message} Could not save the setting: {error:#}"),
+        };
+        self.publish();
+    }
+
     fn select_backend(
         &mut self,
         backend: Backend,
@@ -282,7 +303,7 @@ impl Engine {
     }
 
     fn run(&mut self) {
-        let mut workers = match Workers::new(self.config.threads) {
+        let mut workers = match Workers::new(self.config.threads, self.snapshot.gpu.intensity) {
             Ok(workers) => workers,
             Err(error) => {
                 self.snapshot.status = format!("Could not start mining workers: {error:#}");
@@ -314,6 +335,9 @@ impl Engine {
                     Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Ok(Command::Toggle) => self.automatic = !self.automatic,
                     Ok(Command::SetThreads(count)) => self.set_threads(count, &mut workers),
+                    Ok(Command::SetGpuIntensity(intensity)) => {
+                        self.set_gpu_intensity(intensity, &workers)
+                    }
                     Ok(Command::SelectBackend(backend)) => {
                         // No socket is active and the previous session already drained its work.
                         let _ = self.select_backend(backend, &workers, None);
@@ -526,6 +550,9 @@ impl Engine {
                         };
                     }
                     Ok(Command::SetThreads(count)) => self.set_threads(count, workers),
+                    Ok(Command::SetGpuIntensity(intensity)) => {
+                        self.set_gpu_intensity(intensity, workers)
+                    }
                     Ok(Command::SelectBackend(backend)) => {
                         let previous = self.snapshot.backend;
                         self.select_backend(backend, workers, Some((socket, &mut shares)))?;
