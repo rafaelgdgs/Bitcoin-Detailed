@@ -1256,11 +1256,27 @@ fn hash_quality(series: [Option<Hash256>; HISTORY_SECONDS], width: u16) -> Lines
     } else {
         ""
     };
+    let peak = series
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, hash)| hash.as_ref().map(|hash| (index, hash)))
+        .min_by_key(|&(_, hash)| hash);
     let zeros = series.map(|hash| hash.map(|hash| mining::leading_zero_bits(&hash)));
+    let recent_start = HISTORY_SECONDS - RECENT_SECONDS;
     let axis = Style::new().fg(DIM);
-    let mut lines = vec![label(format!(
-        "Hash quality · {HISTORY_SECONDS}s · zero bits"
-    ))];
+    let mut title = label(format!("Hash quality · {HISTORY_SECONDS}s"));
+    title.spans.push(Span::styled(" · ", axis));
+    title.spans.push(peak.map_or_else(
+        || Span::styled("Peak —", axis),
+        |(_, hash)| {
+            Span::styled(
+                format!("Peak {} bits", mining::leading_zero_bits(hash)),
+                Style::new().fg(MINT).bold(),
+            )
+        },
+    ));
+    let mut lines = vec![title];
 
     for row in (0..CHART_ROWS).rev() {
         let base = row * CHART_ROW_BITS;
@@ -1280,23 +1296,40 @@ fn hash_quality(series: [Option<Hash256>; HISTORY_SECONDS], width: u16) -> Lines
                 None if row == 0 => '·',
                 _ => ' ',
             };
-            let color = if bits.is_none() {
-                BORDER
-            } else if index == HISTORY_SECONDS - 1 {
-                MINT
+            let style = if peak.is_some_and(|(peak_index, _)| index == peak_index) {
+                Style::new().fg(MINT).bold()
+            } else if bits.is_none() {
+                Style::new().fg(BORDER)
             } else {
-                GOLD
+                Style::new().fg(GOLD)
             };
-            Span::styled(format!("{symbol}{spacing}"), Style::new().fg(color))
+            let style = if index >= recent_start {
+                style.bg(RAISED)
+            } else {
+                style
+            };
+            Span::styled(format!("{symbol}{spacing}"), style)
         }));
         lines.push(Line::from(spans));
     }
 
-    let plot_width = HISTORY_SECONDS * (1 + spacing.len());
-    lines.push(Line::styled(
-        format!(" 0 └{} now", "─".repeat(plot_width - 4)),
-        axis,
-    ));
+    let cell_width = 1 + spacing.len();
+    let window_label = format!(" {RECENT_SECONDS}s ");
+    let window_padding = RECENT_SECONDS * cell_width - window_label.len() - 2;
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" 0 └{}", "─".repeat(recent_start * cell_width)),
+            axis,
+        ),
+        Span::styled(
+            format!(
+                "└{}{window_label}{}┘",
+                "─".repeat(window_padding / 2),
+                "─".repeat(window_padding.div_ceil(2)),
+            ),
+            Style::new().fg(TEXT).bg(RAISED),
+        ),
+    ]));
     lines
 }
 
@@ -1648,7 +1681,10 @@ mod tests {
         assert!(with_peak.last().unwrap().to_string().starts_with(" 0 └"));
         assert_eq!(with_peak.last(), without_peak.last());
         for (before, after) in with_peak[1..].iter().zip(&without_peak[1..]) {
-            assert_eq!(before.spans.last(), after.spans.last());
+            assert_eq!(
+                before.spans.last().map(|span| span.content.as_ref()),
+                after.spans.last().map(|span| span.content.as_ref()),
+            );
         }
         let bottom = usize::from(CHART_ROWS);
         assert!(without_peak[bottom - 1].to_string().ends_with('▃'));
@@ -1658,6 +1694,33 @@ mod tests {
                 .iter()
                 .all(|line| line.width() <= usize::from(CHART_MIN_WIDTH))
         );
+    }
+
+    #[test]
+    fn hash_quality_marks_the_ten_second_window_and_labels_the_thirty_second_peak() {
+        let mut peak = [u8::MAX; 32];
+        peak[..5].copy_from_slice(&[0, 0, 0, 0, 0x20]);
+        let recent_start = HISTORY_SECONDS - RECENT_SECONDS;
+        let mut series = [None; HISTORY_SECONDS];
+        series[recent_start - 1] = Some(peak);
+        series[HISTORY_SECONDS - 1] = Some([0x80; 32]);
+
+        for (width, cell_width) in [(CHART_MIN_WIDTH, 1), (64, 2)] {
+            let lines = hash_quality(series, width);
+            assert_eq!(lines[0].to_string(), "Hash quality · 30s · Peak 34 bits");
+            let row = &lines[4];
+            assert!(row.spans[recent_start].content.starts_with('▂'));
+            assert_eq!(row.spans[recent_start].style.fg, Some(MINT));
+            assert_eq!(row.spans[recent_start].style.bg, None);
+            assert_eq!(row.spans[recent_start + 1].style.bg, Some(RAISED));
+            let axis = lines.last().unwrap();
+            assert_eq!(
+                axis.spans[0].width(),
+                usize::from(CHART_AXIS) + recent_start * cell_width
+            );
+            assert_eq!(axis.spans[1].width(), RECENT_SECONDS * cell_width);
+            assert!(axis.spans[1].content.contains("10s"));
+        }
     }
 
     #[test]
